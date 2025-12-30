@@ -18,13 +18,17 @@ from src.freshmart.models import (
     OrderFieldsUpdate,
     OrderFilter,
     OrderFlat,
+    OrderFulfillmentAnalysis,
     OrderLineBatchCreate,
     OrderLineFlat,
     OrderLineUpdate,
     ProductInfo,
+    SplitFulfillmentOption,
     StoreCourierMetrics,
     StoreInfo,
     StoreInventory,
+    StoreRiskLevel,
+    SupplyChainRisk,
     TaskReadyToAdvance,
 )
 from src.freshmart.order_line_service import OrderLineService
@@ -558,3 +562,93 @@ async def list_store_courier_metrics(
     - Courier utilization percentage
     """
     return await service.list_store_courier_metrics(store_id=store_id)
+
+
+# =============================================================================
+# Graph Algorithms (Recursive SQL Views)
+# =============================================================================
+
+
+@router.get("/graph/risks", response_model=list[SupplyChainRisk])
+async def list_supply_chain_risks(
+    entity_type: Optional[str] = Query(default=None, description="Filter by entity type (Store, Order, Customer, DeliveryTask)"),
+    risk_level: Optional[str] = Query(default=None, description="Filter by risk level (CRITICAL, HIGH, MEDIUM, LOW)"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List entities at risk from supply chain risk propagation.
+
+    Uses Materialize WITH MUTUALLY RECURSIVE to propagate risk through the supply chain:
+    - Stores with capacity issues or CLOSED/LIMITED status are risk sources
+    - Risk propagates to orders at those stores
+    - Risk further propagates to customers and delivery tasks
+
+    This is a datalog-style rule evaluation:
+    ```
+    at_risk(Order, high) :- order_store(Order, Store), store_risk(Store, high).
+    at_risk(Customer, medium) :- placed_by(Order, Customer), at_risk(Order, high).
+    ```
+    """
+    return await service.list_supply_chain_risks(
+        entity_type=entity_type,
+        risk_level=risk_level,
+        limit=limit,
+    )
+
+
+@router.get("/graph/store-risks", response_model=list[StoreRiskLevel])
+async def list_store_risk_levels(
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List store risk levels based on capacity utilization and status.
+
+    Risk levels are determined by:
+    - CRITICAL: Store is CLOSED
+    - HIGH: Store is LIMITED or at >90% capacity
+    - MEDIUM: Store at >70% capacity
+    - LOW: Store operating normally
+    """
+    return await service.list_store_risk_levels()
+
+
+@router.get("/graph/split-fulfillment/{product_id:path}", response_model=list[SplitFulfillmentOption])
+async def get_split_fulfillment_options(
+    product_id: str,
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    Get split fulfillment options for a product.
+
+    Uses recursive SQL to find all store combinations that can fulfill
+    a product, useful for split-order fulfillment when a single store
+    doesn't have enough stock.
+
+    Returns store combinations sorted by:
+    1. Number of stores (fewer is better)
+    2. Total available stock (more is better)
+    """
+    return await service.get_split_fulfillment_options(product_id)
+
+
+@router.get("/graph/order-fulfillment/{order_id:path}", response_model=OrderFulfillmentAnalysis)
+async def analyze_order_fulfillment(
+    order_id: str,
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    Analyze how an order can be fulfilled, including split options.
+
+    Checks if the order can be fulfilled from the primary store,
+    and if not, suggests split fulfillment options from other stores.
+
+    Returns:
+    - Whether order can be fulfilled from primary store
+    - List of products that are missing/understocked
+    - Split fulfillment options for missing products
+    """
+    result = await service.analyze_order_fulfillment(order_id)
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return result

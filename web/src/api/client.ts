@@ -387,6 +387,62 @@ export interface TripleWriteRequest {
   object_value: string
 }
 
+// Graph Algorithm Types
+export interface SupplyChainRisk {
+  entity_id: string
+  entity_type: string  // Store, Order, Customer, DeliveryTask
+  risk_level: string   // CRITICAL, HIGH, MEDIUM, LOW
+  risk_distance: number
+  risk_sources: string[]
+}
+
+export interface StoreRiskLevel {
+  store_id: string
+  store_name: string | null
+  store_status: string | null
+  store_capacity_orders_per_hour: number | null
+  active_orders: number
+  risk_level: string
+}
+
+export interface SplitFulfillmentOption {
+  product_id: string
+  store_ids: string[]
+  store_names: string[]
+  total_stock: number
+  store_count: number
+}
+
+export interface OrderFulfillmentAnalysis {
+  order_id: string
+  order_number: string | null
+  primary_store_id: string | null
+  primary_store_name: string | null
+  can_fulfill_from_primary: boolean
+  missing_products: string[]
+  split_options: SplitFulfillmentOption[]
+  total_products: number
+  fulfillable_products: number
+}
+
+export const graphApi = {
+  // Supply chain risk propagation
+  listRisks: (params?: { entity_type?: string; risk_level?: string; limit?: number }) =>
+    apiClient.get<SupplyChainRisk[]>('/freshmart/graph/risks', { params }),
+
+  // Store risk levels
+  listStoreRisks: () =>
+    apiClient.get<StoreRiskLevel[]>('/freshmart/graph/store-risks'),
+
+  // Split fulfillment options for a product
+  getSplitFulfillmentOptions: (productId: string) =>
+    apiClient.get<SplitFulfillmentOption[]>(`/freshmart/graph/split-fulfillment/${encodeURIComponent(productId)}`),
+
+  // Order fulfillment analysis
+  analyzeOrderFulfillment: (orderId: string) =>
+    apiClient.get<OrderFulfillmentAnalysis>(`/freshmart/graph/order-fulfillment/${encodeURIComponent(orderId)}`),
+}
+
 export const queryStatsApi = {
   // Get orders for dropdown selection
   getOrders: () =>

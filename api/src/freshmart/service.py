@@ -12,9 +12,13 @@ from src.freshmart.models import (
     OrderAwaitingCourier,
     OrderFilter,
     OrderFlat,
+    OrderFulfillmentAnalysis,
+    SplitFulfillmentOption,
     StoreCourierMetrics,
     StoreInfo,
     StoreInventory,
+    StoreRiskLevel,
+    SupplyChainRisk,
     TaskReadyToAdvance,
 )
 
@@ -754,3 +758,211 @@ class FreshMartService:
             )
             for row in rows
         ]
+
+    # =========================================================================
+    # Graph Algorithms (Recursive SQL Views)
+    # =========================================================================
+
+    async def list_supply_chain_risks(
+        self,
+        entity_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[SupplyChainRisk]:
+        """List entities at risk from supply chain risk propagation.
+
+        Uses WITH MUTUALLY RECURSIVE to propagate risk from stores to orders,
+        customers, and delivery tasks.
+
+        Args:
+            entity_type: Filter by entity type (Store, Order, Customer, DeliveryTask)
+            risk_level: Filter by risk level (CRITICAL, HIGH, MEDIUM, LOW)
+            limit: Maximum number of results
+
+        Returns:
+            List of entities with their risk levels
+        """
+        conditions = []
+        params: dict = {"limit": limit}
+
+        if entity_type:
+            conditions.append("entity_type = :entity_type")
+            params["entity_type"] = entity_type
+        if risk_level:
+            conditions.append("risk_level = :risk_level")
+            params["risk_level"] = risk_level
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT entity_id, entity_type, risk_level, risk_distance, risk_sources
+            FROM supply_chain_risk_mv
+            {where_clause}
+            ORDER BY
+                CASE risk_level
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    ELSE 4
+                END,
+                risk_distance
+            LIMIT :limit
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            SupplyChainRisk(
+                entity_id=row.entity_id,
+                entity_type=row.entity_type,
+                risk_level=row.risk_level,
+                risk_distance=row.risk_distance or 0,
+                risk_sources=row.risk_sources if isinstance(row.risk_sources, list) else [],
+            )
+            for row in rows
+        ]
+
+    async def list_store_risk_levels(self) -> list[StoreRiskLevel]:
+        """List store risk levels based on capacity and status.
+
+        Returns:
+            List of stores with their risk levels
+        """
+        query = """
+            SELECT store_id, store_name, store_status,
+                   store_capacity_orders_per_hour, active_orders, risk_level
+            FROM store_risk_levels
+            ORDER BY
+                CASE risk_level
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    ELSE 4
+                END,
+                store_name
+        """
+
+        result = await self.session.execute(text(query))
+        rows = result.fetchall()
+
+        return [
+            StoreRiskLevel(
+                store_id=row.store_id,
+                store_name=row.store_name,
+                store_status=row.store_status,
+                store_capacity_orders_per_hour=row.store_capacity_orders_per_hour,
+                active_orders=row.active_orders or 0,
+                risk_level=row.risk_level,
+            )
+            for row in rows
+        ]
+
+    async def get_split_fulfillment_options(
+        self,
+        product_id: str,
+    ) -> list[SplitFulfillmentOption]:
+        """Get split fulfillment options for a product.
+
+        Shows which combinations of stores can fulfill the product.
+
+        Args:
+            product_id: Product to check
+
+        Returns:
+            List of store combinations that can fulfill the product
+        """
+        # Query the multi_store_product_coverage_mv view
+        query = """
+            SELECT product_id, store_set, total_stock, store_count
+            FROM multi_store_product_coverage_mv
+            WHERE product_id = :product_id
+            ORDER BY store_count, total_stock DESC
+            LIMIT 20
+        """
+
+        result = await self.session.execute(text(query), {"product_id": product_id})
+        rows = result.fetchall()
+
+        options = []
+        for row in rows:
+            # Parse store_set (comma-separated store IDs)
+            store_ids = [s.strip() for s in row.store_set.split(",")] if row.store_set else []
+            options.append(
+                SplitFulfillmentOption(
+                    product_id=row.product_id,
+                    store_ids=store_ids,
+                    store_names=[],  # Would need join to get names
+                    total_stock=row.total_stock or 0,
+                    store_count=row.store_count or 0,
+                )
+            )
+
+        return options
+
+    async def analyze_order_fulfillment(
+        self,
+        order_id: str,
+    ) -> Optional[OrderFulfillmentAnalysis]:
+        """Analyze how an order can be fulfilled, including split options.
+
+        Args:
+            order_id: Order to analyze
+
+        Returns:
+            Fulfillment analysis with split options for missing products
+        """
+        # Get order details
+        order = await self.get_order(order_id)
+        if not order:
+            return None
+
+        # Get order line items
+        lines = await self.list_order_lines(order_id)
+
+        # Check inventory at primary store
+        inventory_view = self._get_view("store_inventory_flat")
+        products_view = self._get_view("products_flat")
+
+        query = f"""
+            SELECT ol.product_id, ol.quantity,
+                   p.product_name,
+                   COALESCE(inv.stock_level, 0) AS available_stock
+            FROM order_lines_flat ol
+            LEFT JOIN {products_view} p ON p.product_id = ol.product_id
+            LEFT JOIN {inventory_view} inv
+                ON inv.product_id = ol.product_id
+                AND inv.store_id = :store_id
+            WHERE ol.order_id = :order_id
+        """
+
+        result = await self.session.execute(
+            text(query),
+            {"order_id": order_id, "store_id": order.store_id}
+        )
+        rows = result.fetchall()
+
+        missing_products = []
+        split_options = []
+
+        for row in rows:
+            if row.available_stock < row.quantity:
+                missing_products.append(row.product_id)
+                # Get split options for this product
+                options = await self.get_split_fulfillment_options(row.product_id)
+                for opt in options:
+                    if opt.total_stock >= row.quantity:
+                        split_options.append(opt)
+                        break  # Just get first viable option
+
+        return OrderFulfillmentAnalysis(
+            order_id=order_id,
+            order_number=order.order_number,
+            primary_store_id=order.store_id,
+            primary_store_name=order.store_name,
+            can_fulfill_from_primary=len(missing_products) == 0,
+            missing_products=missing_products,
+            split_options=split_options,
+            total_products=len(rows),
+            fulfillable_products=len(rows) - len(missing_products),
+        )

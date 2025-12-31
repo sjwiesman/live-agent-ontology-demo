@@ -257,3 +257,103 @@ class StoreCourierMetrics(BaseModel):
     estimated_wait_minutes: Optional[float] = None
     courier_utilization_pct: Optional[float] = None
     effective_updated_at: Optional[datetime] = None
+
+
+# =============================================================================
+# Graph Algorithm Models (Recursive SQL Views)
+# =============================================================================
+
+
+class SupplyChainRisk(BaseModel):
+    """Supply chain risk from recursive risk propagation view."""
+
+    entity_id: str
+    entity_type: str  # Store, Order, Customer, DeliveryTask
+    risk_level: str  # CRITICAL, HIGH, MEDIUM, LOW
+    risk_distance: int  # How many hops from the risk source
+    risk_sources: Optional[list[str]] = Field(default_factory=list)
+
+
+class StoreRiskLevel(BaseModel):
+    """Store risk level with capacity metrics."""
+
+    store_id: str
+    store_name: Optional[str] = None
+    store_status: Optional[str] = None
+    store_capacity_orders_per_hour: Optional[int] = None
+    active_orders: int = 0
+    risk_level: str  # CRITICAL, HIGH, MEDIUM, LOW
+
+
+class SplitFulfillmentOption(BaseModel):
+    """Split fulfillment option showing stores that can fulfill a product."""
+
+    product_id: str
+    store_ids: list[str] = Field(default_factory=list)
+    store_names: list[str] = Field(default_factory=list)
+    total_stock: int = 0
+    store_count: int = 0
+
+
+class OrderFulfillmentAnalysis(BaseModel):
+    """Analysis of how an order can be fulfilled across stores."""
+
+    order_id: str
+    order_number: Optional[str] = None
+    primary_store_id: Optional[str] = None
+    primary_store_name: Optional[str] = None
+    can_fulfill_from_primary: bool = False
+    missing_products: list[str] = Field(default_factory=list)
+    split_options: list[SplitFulfillmentOption] = Field(default_factory=list)
+    total_products: int = 0
+    fulfillable_products: int = 0
+
+
+# =============================================================================
+# Advanced Graph Algorithm Models (Mutually Recursive)
+# =============================================================================
+
+
+class CustomerCohort(BaseModel):
+    """Customer cohort from bidirectional reachability analysis.
+
+    Two customers are in the same cohort if they can reach each other
+    through shared purchase patterns (strongly connected).
+    """
+
+    customer_a: str
+    customer_b: str
+    min_distance: int  # Minimum hops between them
+    forward_hops: int  # Hops from A to B
+    backward_hops: int  # Hops from B to A
+    connection_type: str = "BIDIRECTIONAL"
+
+
+class InfluenceScore(BaseModel):
+    """Influence score from PageRank-style mutual scoring.
+
+    Customer influence depends on product quality, and product quality
+    depends on customer influence - computed through mutual recursion.
+    """
+
+    entity_type: str  # 'customer' or 'product'
+    entity_id: str
+    influence_score: float
+    iterations: int  # Number of iterations to converge
+
+
+class DeliveryBundle(BaseModel):
+    """Delivery bundle with conflict detection.
+
+    Shows orders that can be bundled together, and detects inventory
+    conflicts where orders compete for scarce resources.
+    """
+
+    order_a: str
+    order_b: str
+    store_id: str
+    bundle_size: int
+    has_conflict: bool = False
+    conflict_product: Optional[str] = None
+    available_stock: Optional[int] = None
+    total_needed: Optional[int] = None

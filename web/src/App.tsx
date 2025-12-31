@@ -9,6 +9,7 @@ import {
   Network,
   TrendingUp,
   BarChart3,
+  GitBranch,
 } from 'lucide-react'
 
 import OntologyClassesPage from './pages/OntologyClassesPage'
@@ -20,6 +21,7 @@ import CouriersSchedulePage from './pages/CouriersSchedulePage'
 import SettingsPage from './pages/SettingsPage'
 import MetricsDashboardPage from './pages/MetricsDashboardPage'
 import QueryStatisticsPage from './pages/QueryStatisticsPage'
+import GraphAlgorithmsPage from './pages/GraphAlgorithmsPage'
 import { PropagationProvider } from './contexts/PropagationContext'
 import { ChatProvider } from './contexts/ChatContext'
 import PropagationWidget from './components/PropagationWidget'
@@ -28,6 +30,7 @@ import ChatWidget from './components/ChatWidget'
 const navItems = [
   { path: '/', icon: BarChart3, label: 'IVM Demo' },
   { path: '/metrics', icon: TrendingUp, label: 'Live Metrics' },
+  { path: '/graph', icon: GitBranch, label: 'Graph Algorithms' },
   { path: '/orders', icon: ShoppingCart, label: 'Orders' },
   { path: '/stores', icon: Warehouse, label: 'Stores & Inventory' },
   { path: '/couriers', icon: Truck, label: 'Couriers' },
@@ -74,6 +77,7 @@ function App() {
               <Routes>
                 <Route path="/" element={<QueryStatisticsPage />} />
                 <Route path="/metrics" element={<MetricsDashboardPage />} />
+                <Route path="/graph" element={<GraphAlgorithmsPage />} />
                 <Route path="/orders" element={<OrdersDashboardPage />} />
                 <Route path="/stores" element={<StoresInventoryPage />} />
                 <Route path="/couriers" element={<CouriersSchedulePage />} />

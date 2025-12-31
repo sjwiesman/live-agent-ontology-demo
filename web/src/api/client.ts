@@ -387,6 +387,102 @@ export interface TripleWriteRequest {
   object_value: string
 }
 
+// Graph Algorithm Types
+export interface SupplyChainRisk {
+  entity_id: string
+  entity_type: string  // Store, Order, Customer, DeliveryTask
+  risk_level: string   // CRITICAL, HIGH, MEDIUM, LOW
+  risk_distance: number
+  risk_sources: string[]
+}
+
+export interface StoreRiskLevel {
+  store_id: string
+  store_name: string | null
+  store_status: string | null
+  store_capacity_orders_per_hour: number | null
+  active_orders: number
+  risk_level: string
+}
+
+export interface SplitFulfillmentOption {
+  product_id: string
+  store_ids: string[]
+  store_names: string[]
+  total_stock: number
+  store_count: number
+}
+
+export interface OrderFulfillmentAnalysis {
+  order_id: string
+  order_number: string | null
+  primary_store_id: string | null
+  primary_store_name: string | null
+  can_fulfill_from_primary: boolean
+  missing_products: string[]
+  split_options: SplitFulfillmentOption[]
+  total_products: number
+  fulfillable_products: number
+}
+
+// Advanced Graph Algorithm Types (Mutually Recursive)
+export interface CustomerCohort {
+  customer_a: string
+  customer_b: string
+  min_distance: number
+  forward_hops: number
+  backward_hops: number
+  connection_type: string
+}
+
+export interface InfluenceScore {
+  entity_type: string  // 'customer' or 'product'
+  entity_id: string
+  influence_score: number
+  iterations: number
+}
+
+export interface DeliveryBundle {
+  order_a: string
+  order_b: string
+  store_id: string
+  bundle_size: number
+  has_conflict: boolean
+  conflict_product: string | null
+  available_stock: number | null
+  total_needed: number | null
+}
+
+export const graphApi = {
+  // Supply chain risk propagation
+  listRisks: (params?: { entity_type?: string; risk_level?: string; limit?: number }) =>
+    apiClient.get<SupplyChainRisk[]>('/freshmart/graph/risks', { params }),
+
+  // Store risk levels
+  listStoreRisks: () =>
+    apiClient.get<StoreRiskLevel[]>('/freshmart/graph/store-risks'),
+
+  // Split fulfillment options for a product
+  getSplitFulfillmentOptions: (productId: string) =>
+    apiClient.get<SplitFulfillmentOption[]>(`/freshmart/graph/split-fulfillment/${encodeURIComponent(productId)}`),
+
+  // Order fulfillment analysis
+  analyzeOrderFulfillment: (orderId: string) =>
+    apiClient.get<OrderFulfillmentAnalysis>(`/freshmart/graph/order-fulfillment/${encodeURIComponent(orderId)}`),
+
+  // Customer cohorts (bidirectional reachability / SCC-like)
+  listCustomerCohorts: (params?: { customer_id?: string; limit?: number }) =>
+    apiClient.get<CustomerCohort[]>('/freshmart/graph/customer-cohorts', { params }),
+
+  // Influence scores (PageRank-style mutual scoring)
+  listInfluenceScores: (params?: { entity_type?: string; limit?: number }) =>
+    apiClient.get<InfluenceScore[]>('/freshmart/graph/influence-scores', { params }),
+
+  // Delivery bundles with conflict detection
+  listDeliveryBundles: (params?: { store_id?: string; show_conflicts?: boolean; limit?: number }) =>
+    apiClient.get<DeliveryBundle[]>('/freshmart/graph/delivery-bundles', { params }),
+}
+
 export const queryStatsApi = {
   // Get orders for dropdown selection
   getOrders: () =>

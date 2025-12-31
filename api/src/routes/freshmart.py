@@ -12,19 +12,26 @@ from src.db.client import get_mz_session_factory, get_pg_session_factory
 from src.freshmart.models import (
     CourierAvailable,
     CourierSchedule,
+    CustomerCohort,
     CustomerInfo,
+    DeliveryBundle,
+    InfluenceScore,
     OrderAtomicUpdate,
     OrderAwaitingCourier,
     OrderFieldsUpdate,
     OrderFilter,
     OrderFlat,
+    OrderFulfillmentAnalysis,
     OrderLineBatchCreate,
     OrderLineFlat,
     OrderLineUpdate,
     ProductInfo,
+    SplitFulfillmentOption,
     StoreCourierMetrics,
     StoreInfo,
     StoreInventory,
+    StoreRiskLevel,
+    SupplyChainRisk,
     TaskReadyToAdvance,
 )
 from src.freshmart.order_line_service import OrderLineService
@@ -558,3 +565,183 @@ async def list_store_courier_metrics(
     - Courier utilization percentage
     """
     return await service.list_store_courier_metrics(store_id=store_id)
+
+
+# =============================================================================
+# Graph Algorithms (Recursive SQL Views)
+# =============================================================================
+
+
+@router.get("/graph/risks", response_model=list[SupplyChainRisk])
+async def list_supply_chain_risks(
+    entity_type: Optional[str] = Query(default=None, description="Filter by entity type (Store, Order, Customer, DeliveryTask)"),
+    risk_level: Optional[str] = Query(default=None, description="Filter by risk level (CRITICAL, HIGH, MEDIUM, LOW)"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List entities at risk from supply chain risk propagation.
+
+    Uses Materialize WITH MUTUALLY RECURSIVE to propagate risk through the supply chain:
+    - Stores with capacity issues or CLOSED/LIMITED status are risk sources
+    - Risk propagates to orders at those stores
+    - Risk further propagates to customers and delivery tasks
+
+    This is a datalog-style rule evaluation:
+    ```
+    at_risk(Order, high) :- order_store(Order, Store), store_risk(Store, high).
+    at_risk(Customer, medium) :- placed_by(Order, Customer), at_risk(Order, high).
+    ```
+    """
+    return await service.list_supply_chain_risks(
+        entity_type=entity_type,
+        risk_level=risk_level,
+        limit=limit,
+    )
+
+
+@router.get("/graph/store-risks", response_model=list[StoreRiskLevel])
+async def list_store_risk_levels(
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List store risk levels based on capacity utilization and status.
+
+    Risk levels are determined by:
+    - CRITICAL: Store is CLOSED
+    - HIGH: Store is LIMITED or at >90% capacity
+    - MEDIUM: Store at >70% capacity
+    - LOW: Store operating normally
+    """
+    return await service.list_store_risk_levels()
+
+
+@router.get("/graph/split-fulfillment/{product_id:path}", response_model=list[SplitFulfillmentOption])
+async def get_split_fulfillment_options(
+    product_id: str,
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    Get split fulfillment options for a product.
+
+    Uses recursive SQL to find all store combinations that can fulfill
+    a product, useful for split-order fulfillment when a single store
+    doesn't have enough stock.
+
+    Returns store combinations sorted by:
+    1. Number of stores (fewer is better)
+    2. Total available stock (more is better)
+    """
+    return await service.get_split_fulfillment_options(product_id)
+
+
+@router.get("/graph/order-fulfillment/{order_id:path}", response_model=OrderFulfillmentAnalysis)
+async def analyze_order_fulfillment(
+    order_id: str,
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    Analyze how an order can be fulfilled, including split options.
+
+    Checks if the order can be fulfilled from the primary store,
+    and if not, suggests split fulfillment options from other stores.
+
+    Returns:
+    - Whether order can be fulfilled from primary store
+    - List of products that are missing/understocked
+    - Split fulfillment options for missing products
+    """
+    result = await service.analyze_order_fulfillment(order_id)
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return result
+
+
+# =============================================================================
+# Advanced Graph Algorithms (Mutually Recursive)
+# =============================================================================
+
+
+@router.get("/graph/customer-cohorts", response_model=list[CustomerCohort])
+async def list_customer_cohorts(
+    customer_id: Optional[str] = Query(default=None, description="Filter to show cohorts for a specific customer"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List customer cohorts from bidirectional reachability analysis.
+
+    Uses TRUE mutual recursion: forward_reach and backward_reach CTEs
+    reference EACH OTHER to find strongly connected customer groups.
+
+    Datalog equivalent:
+    ```
+    forward(A, B) :- edge(A, B).
+    forward(A, C) :- forward(A, B), edge(B, C), EXISTS backward(A, _).
+    backward(A, B) :- edge(B, A).
+    backward(A, C) :- backward(A, B), edge(C, B), EXISTS forward(A, _).
+    same_cohort(A, B) :- forward(A, B), backward(A, B).
+    ```
+
+    This finds customers who are mutually reachable through shared purchases -
+    similar to strongly connected components in graph theory.
+    """
+    return await service.list_customer_cohorts(customer_id=customer_id, limit=limit)
+
+
+@router.get("/graph/influence-scores", response_model=list[InfluenceScore])
+async def list_influence_scores(
+    entity_type: Optional[str] = Query(default=None, description="Filter by 'customer' or 'product'"),
+    limit: int = Query(default=50, ge=1, le=500),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List influence scores from PageRank-style mutual scoring.
+
+    Uses TRUE mutual recursion: customer_score and product_score
+    reference EACH OTHER in their recursive definitions.
+
+    Datalog equivalent:
+    ```
+    customer_score(C, 1.0) :- customer(C).
+    product_score(P, 1.0) :- product(P).
+    customer_score(C, 0.85 * avg(S) + 0.15) :- buys(C, P), product_score(P, S).
+    product_score(P, 0.85 * avg(S) + 0.15) :- buys(C, P), customer_score(C, S).
+    ```
+
+    Like PageRank, scores converge through iterative refinement where
+    customer influence depends on product quality and vice versa.
+    """
+    return await service.list_influence_scores(entity_type=entity_type, limit=limit)
+
+
+@router.get("/graph/delivery-bundles", response_model=list[DeliveryBundle])
+async def list_delivery_bundles(
+    store_id: Optional[str] = Query(default=None, description="Filter by store"),
+    show_conflicts: Optional[bool] = Query(default=None, description="True=only conflicts, False=no conflicts, None=all"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List delivery bundles with conflict detection.
+
+    Uses TRUE mutual recursion: bundle_candidates and inventory_conflicts
+    reference EACH OTHER - bundles exclude conflicting orders, and
+    conflicts propagate transitively through bundles.
+
+    Datalog equivalent:
+    ```
+    can_bundle(O1, O2) :- same_store(O1, O2), compatible_time(O1, O2),
+                          NOT has_conflict(O1, O2).
+    has_conflict(O1, O2) :- shares_scarce_product(O1, O2, P), limited_stock(P).
+    has_conflict(O1, O3) :- has_conflict(O1, O2), can_bundle(O2, O3).
+    ```
+
+    This finds orders that can be delivered together while detecting
+    inventory conflicts where orders compete for scarce resources.
+    """
+    return await service.list_delivery_bundles(
+        store_id=store_id,
+        show_conflicts=show_conflicts,
+        limit=limit,
+    )

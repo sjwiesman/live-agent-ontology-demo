@@ -12,7 +12,10 @@ from src.db.client import get_mz_session_factory, get_pg_session_factory
 from src.freshmart.models import (
     CourierAvailable,
     CourierSchedule,
+    CustomerCohort,
     CustomerInfo,
+    DeliveryBundle,
+    InfluenceScore,
     OrderAtomicUpdate,
     OrderAwaitingCourier,
     OrderFieldsUpdate,
@@ -652,3 +655,93 @@ async def analyze_order_fulfillment(
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     return result
+
+
+# =============================================================================
+# Advanced Graph Algorithms (Mutually Recursive)
+# =============================================================================
+
+
+@router.get("/graph/customer-cohorts", response_model=list[CustomerCohort])
+async def list_customer_cohorts(
+    customer_id: Optional[str] = Query(default=None, description="Filter to show cohorts for a specific customer"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List customer cohorts from bidirectional reachability analysis.
+
+    Uses TRUE mutual recursion: forward_reach and backward_reach CTEs
+    reference EACH OTHER to find strongly connected customer groups.
+
+    Datalog equivalent:
+    ```
+    forward(A, B) :- edge(A, B).
+    forward(A, C) :- forward(A, B), edge(B, C), EXISTS backward(A, _).
+    backward(A, B) :- edge(B, A).
+    backward(A, C) :- backward(A, B), edge(C, B), EXISTS forward(A, _).
+    same_cohort(A, B) :- forward(A, B), backward(A, B).
+    ```
+
+    This finds customers who are mutually reachable through shared purchases -
+    similar to strongly connected components in graph theory.
+    """
+    return await service.list_customer_cohorts(customer_id=customer_id, limit=limit)
+
+
+@router.get("/graph/influence-scores", response_model=list[InfluenceScore])
+async def list_influence_scores(
+    entity_type: Optional[str] = Query(default=None, description="Filter by 'customer' or 'product'"),
+    limit: int = Query(default=50, ge=1, le=500),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List influence scores from PageRank-style mutual scoring.
+
+    Uses TRUE mutual recursion: customer_score and product_score
+    reference EACH OTHER in their recursive definitions.
+
+    Datalog equivalent:
+    ```
+    customer_score(C, 1.0) :- customer(C).
+    product_score(P, 1.0) :- product(P).
+    customer_score(C, 0.85 * avg(S) + 0.15) :- buys(C, P), product_score(P, S).
+    product_score(P, 0.85 * avg(S) + 0.15) :- buys(C, P), customer_score(C, S).
+    ```
+
+    Like PageRank, scores converge through iterative refinement where
+    customer influence depends on product quality and vice versa.
+    """
+    return await service.list_influence_scores(entity_type=entity_type, limit=limit)
+
+
+@router.get("/graph/delivery-bundles", response_model=list[DeliveryBundle])
+async def list_delivery_bundles(
+    store_id: Optional[str] = Query(default=None, description="Filter by store"),
+    show_conflicts: Optional[bool] = Query(default=None, description="True=only conflicts, False=no conflicts, None=all"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List delivery bundles with conflict detection.
+
+    Uses TRUE mutual recursion: bundle_candidates and inventory_conflicts
+    reference EACH OTHER - bundles exclude conflicting orders, and
+    conflicts propagate transitively through bundles.
+
+    Datalog equivalent:
+    ```
+    can_bundle(O1, O2) :- same_store(O1, O2), compatible_time(O1, O2),
+                          NOT has_conflict(O1, O2).
+    has_conflict(O1, O2) :- shares_scarce_product(O1, O2, P), limited_stock(P).
+    has_conflict(O1, O3) :- has_conflict(O1, O2), can_bundle(O2, O3).
+    ```
+
+    This finds orders that can be delivered together while detecting
+    inventory conflicts where orders compete for scarce resources.
+    """
+    return await service.list_delivery_bundles(
+        store_id=store_id,
+        show_conflicts=show_conflicts,
+        limit=limit,
+    )

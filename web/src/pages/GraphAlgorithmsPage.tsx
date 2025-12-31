@@ -12,13 +12,19 @@ import {
   Package,
   GitBranch,
   RefreshCw,
+  Users,
+  TrendingUp,
+  Layers,
+  Link,
+  Zap,
 } from 'lucide-react'
 import {
   graphApi,
   freshmartApi,
   SupplyChainRisk,
-  StoreRiskLevel,
-  OrderFulfillmentAnalysis,
+  CustomerCohort,
+  InfluenceScore,
+  DeliveryBundle,
 } from '../api/client'
 
 const riskColors: Record<string, string> = {
@@ -57,11 +63,16 @@ function EntityIcon({ type }: { type: string }) {
   return <Icon className="h-4 w-4" />
 }
 
+type TabType = 'risk' | 'fulfillment' | 'cohorts' | 'influence' | 'bundles'
+
 export default function GraphAlgorithmsPage() {
   const [selectedOrderId, setSelectedOrderId] = useState<string>('')
-  const [activeTab, setActiveTab] = useState<'risk' | 'fulfillment'>('risk')
+  const [activeTab, setActiveTab] = useState<TabType>('cohorts')
   const [entityTypeFilter, setEntityTypeFilter] = useState<string>('')
   const [riskLevelFilter, setRiskLevelFilter] = useState<string>('')
+  const [influenceTypeFilter, setInfluenceTypeFilter] = useState<string>('')
+  const [bundleStoreFilter, setBundleStoreFilter] = useState<string>('')
+  const [showConflictsOnly, setShowConflictsOnly] = useState<boolean>(false)
 
   // Fetch supply chain risks
   const { data: risks, isLoading: risksLoading, refetch: refetchRisks } = useQuery({
@@ -73,6 +84,7 @@ export default function GraphAlgorithmsPage() {
       const response = await graphApi.listRisks(params)
       return response.data
     },
+    enabled: activeTab === 'risk',
   })
 
   // Fetch store risk levels
@@ -82,6 +94,7 @@ export default function GraphAlgorithmsPage() {
       const response = await graphApi.listStoreRisks()
       return response.data
     },
+    enabled: activeTab === 'risk',
   })
 
   // Fetch orders for fulfillment analysis dropdown
@@ -91,6 +104,7 @@ export default function GraphAlgorithmsPage() {
       const response = await freshmartApi.listOrders({ status: 'CREATED' })
       return response.data
     },
+    enabled: activeTab === 'fulfillment',
   })
 
   // Fetch fulfillment analysis for selected order
@@ -101,7 +115,52 @@ export default function GraphAlgorithmsPage() {
       const response = await graphApi.analyzeOrderFulfillment(selectedOrderId)
       return response.data
     },
-    enabled: !!selectedOrderId,
+    enabled: !!selectedOrderId && activeTab === 'fulfillment',
+  })
+
+  // Fetch customer cohorts
+  const { data: cohorts, isLoading: cohortsLoading, refetch: refetchCohorts } = useQuery({
+    queryKey: ['customer-cohorts'],
+    queryFn: async () => {
+      const response = await graphApi.listCustomerCohorts({ limit: 50 })
+      return response.data
+    },
+    enabled: activeTab === 'cohorts',
+  })
+
+  // Fetch influence scores
+  const { data: influenceScores, isLoading: influenceLoading, refetch: refetchInfluence } = useQuery({
+    queryKey: ['influence-scores', influenceTypeFilter],
+    queryFn: async () => {
+      const params: { entity_type?: string; limit?: number } = { limit: 50 }
+      if (influenceTypeFilter) params.entity_type = influenceTypeFilter
+      const response = await graphApi.listInfluenceScores(params)
+      return response.data
+    },
+    enabled: activeTab === 'influence',
+  })
+
+  // Fetch delivery bundles
+  const { data: bundles, isLoading: bundlesLoading, refetch: refetchBundles } = useQuery({
+    queryKey: ['delivery-bundles', bundleStoreFilter, showConflictsOnly],
+    queryFn: async () => {
+      const params: { store_id?: string; show_conflicts?: boolean; limit?: number } = { limit: 100 }
+      if (bundleStoreFilter) params.store_id = bundleStoreFilter
+      if (showConflictsOnly) params.show_conflicts = true
+      const response = await graphApi.listDeliveryBundles(params)
+      return response.data
+    },
+    enabled: activeTab === 'bundles',
+  })
+
+  // Fetch stores for bundle filter
+  const { data: stores } = useQuery({
+    queryKey: ['stores-for-bundles'],
+    queryFn: async () => {
+      const response = await freshmartApi.listStores()
+      return response.data
+    },
+    enabled: activeTab === 'bundles',
   })
 
   // Group risks by entity type
@@ -117,43 +176,595 @@ export default function GraphAlgorithmsPage() {
     return acc
   }, {} as Record<string, number>)
 
+  // Group cohorts by unique customer pairs
+  const cohortPairs = (cohorts || []).reduce((acc, cohort) => {
+    const key = [cohort.customer_a, cohort.customer_b].sort().join('|')
+    if (!acc.has(key)) {
+      acc.set(key, cohort)
+    }
+    return acc
+  }, new Map<string, CustomerCohort>())
+
+  // Split influence scores by type
+  const customerScores = (influenceScores || []).filter(s => s.entity_type === 'customer')
+  const productScores = (influenceScores || []).filter(s => s.entity_type === 'product')
+
+  // Count bundle conflicts
+  const conflictCount = (bundles || []).filter(b => b.has_conflict).length
+  const totalBundles = (bundles || []).length
+
+  const tabs: { id: TabType; label: string; icon: typeof AlertTriangle; description: string }[] = [
+    { id: 'cohorts', label: 'Customer Cohorts', icon: Users, description: 'Bidirectional Reachability (SCC)' },
+    { id: 'influence', label: 'Influence Scores', icon: TrendingUp, description: 'PageRank-style Mutual Scoring' },
+    { id: 'bundles', label: 'Delivery Bundles', icon: Layers, description: 'Conflict Detection' },
+    { id: 'risk', label: 'Risk Propagation', icon: AlertTriangle, description: 'Transitive Risk' },
+    { id: 'fulfillment', label: 'Split Fulfillment', icon: GitBranch, description: 'Multi-Store Coverage' },
+  ]
+
   return (
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-gray-900">Graph Algorithms</h1>
         <p className="text-gray-600 mt-1">
-          Supply chain risk propagation and split order fulfillment using Materialize WITH MUTUALLY RECURSIVE
+          Mutually recursive datalog-style algorithms using Materialize <code className="bg-gray-100 px-1 rounded">WITH MUTUALLY RECURSIVE</code>
         </p>
       </div>
 
       {/* Tabs */}
       <div className="border-b border-gray-200 mb-6">
-        <nav className="-mb-px flex space-x-8">
-          <button
-            onClick={() => setActiveTab('risk')}
-            className={`py-2 px-1 border-b-2 font-medium text-sm ${
-              activeTab === 'risk'
-                ? 'border-green-500 text-green-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            }`}
-          >
-            <AlertTriangle className="h-4 w-4 inline mr-2" />
-            Risk Propagation
-          </button>
-          <button
-            onClick={() => setActiveTab('fulfillment')}
-            className={`py-2 px-1 border-b-2 font-medium text-sm ${
-              activeTab === 'fulfillment'
-                ? 'border-green-500 text-green-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            }`}
-          >
-            <GitBranch className="h-4 w-4 inline mr-2" />
-            Split Fulfillment
-          </button>
+        <nav className="-mb-px flex space-x-6 overflow-x-auto">
+          {tabs.map(({ id, label, icon: Icon, description }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap ${
+                activeTab === id
+                  ? 'border-green-500 text-green-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              }`}
+            >
+              <Icon className="h-4 w-4 inline mr-2" />
+              {label}
+              <span className="block text-xs font-normal text-gray-400">{description}</span>
+            </button>
+          ))}
         </nav>
       </div>
+
+      {/* Customer Cohorts Tab */}
+      {activeTab === 'cohorts' && (
+        <div className="space-y-6">
+          {/* Explanation */}
+          <div className="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-4 border border-purple-200">
+            <div className="flex items-start gap-3">
+              <Users className="h-6 w-6 text-purple-600 mt-1" />
+              <div>
+                <h3 className="font-semibold text-purple-900">Bidirectional Reachability (Strongly Connected Components)</h3>
+                <p className="text-sm text-purple-700 mt-1">
+                  Finds customers who can reach each other through shared product purchases. Uses <strong>two mutually recursive CTEs</strong>:
+                  <code className="mx-1 bg-purple-100 px-1 rounded">forward_reach</code> and <code className="bg-purple-100 px-1 rounded">backward_reach</code>
+                  that reference each other to compute bidirectional paths.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-3 gap-4">
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-purple-600 mb-2">
+                <Users className="h-5 w-5" />
+                <span className="font-medium">Customer Pairs</span>
+              </div>
+              <p className="text-3xl font-bold">{cohortPairs.size}</p>
+              <p className="text-sm text-gray-500">bidirectionally connected</p>
+            </div>
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-indigo-600 mb-2">
+                <Link className="h-5 w-5" />
+                <span className="font-medium">Avg Distance</span>
+              </div>
+              <p className="text-3xl font-bold">
+                {cohorts && cohorts.length > 0
+                  ? (cohorts.reduce((sum, c) => sum + c.min_distance, 0) / cohorts.length).toFixed(1)
+                  : '-'}
+              </p>
+              <p className="text-sm text-gray-500">hops between pairs</p>
+            </div>
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-green-600 mb-2">
+                <Zap className="h-5 w-5" />
+                <span className="font-medium">Algorithm</span>
+              </div>
+              <p className="text-lg font-bold">Mutual Recursion</p>
+              <p className="text-sm text-gray-500">forward ↔ backward reach</p>
+            </div>
+          </div>
+
+          {/* Cohort Network Visualization */}
+          <div className="bg-white rounded-lg shadow">
+            <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Customer Cohort Network</h2>
+                <p className="text-sm text-gray-500">Customers connected through shared purchase patterns</p>
+              </div>
+              <button
+                onClick={() => refetchCohorts()}
+                className="p-2 text-gray-500 hover:text-gray-700"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="p-4">
+              {cohortsLoading ? (
+                <p className="text-gray-500">Computing bidirectional reachability...</p>
+              ) : cohorts?.length === 0 ? (
+                <div className="text-center py-8 text-gray-500">
+                  <Users className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p>No customer cohorts found</p>
+                  <p className="text-sm">Customers need shared purchase history to form cohorts</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Customer A</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Connection</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Customer B</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Forward Hops</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Backward Hops</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Min Distance</th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                      {Array.from(cohortPairs.values()).map((cohort, idx) => (
+                        <tr key={idx} className="hover:bg-gray-50">
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <User className="h-4 w-4 text-purple-500" />
+                              <span className="text-sm font-mono">{cohort.customer_a}</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-center">
+                            <span className="inline-flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-800 rounded-full text-xs">
+                              <span>↔</span>
+                              {cohort.connection_type}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <User className="h-4 w-4 text-indigo-500" />
+                              <span className="text-sm font-mono">{cohort.customer_b}</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-center">
+                            <span className="text-sm text-gray-600">{cohort.forward_hops} →</span>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-center">
+                            <span className="text-sm text-gray-600">← {cohort.backward_hops}</span>
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap text-center">
+                            <span className="inline-flex items-center justify-center h-6 w-6 bg-gray-100 rounded-full text-sm font-medium">
+                              {cohort.min_distance}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Algorithm Explanation */}
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h3 className="font-medium mb-2">Mutually Recursive SQL Pattern</h3>
+            <pre className="text-xs bg-gray-800 text-green-400 p-3 rounded overflow-x-auto">
+{`WITH MUTUALLY RECURSIVE
+  forward_reach(from_cust, to_cust, hops) AS (
+    -- Base: direct connections
+    SELECT customer_id, other_customer, 1 FROM customer_product_edges
+    UNION
+    -- Recursive: extend path if backward path exists
+    SELECT f.from_cust, e.other_customer, f.hops + 1
+    FROM forward_reach f
+    JOIN customer_product_edges e ON e.customer_id = f.to_cust
+    WHERE f.hops < 5
+      AND EXISTS (SELECT 1 FROM backward_reach b  -- ← MUTUAL REFERENCE
+                  WHERE b.from_cust = f.from_cust)
+  ),
+  backward_reach(from_cust, to_cust, hops) AS (
+    -- Base: direct connections (reversed)
+    SELECT other_customer, customer_id, 1 FROM customer_product_edges
+    UNION
+    -- Recursive: extend path if forward path exists
+    SELECT b.from_cust, e.customer_id, b.hops + 1
+    FROM backward_reach b
+    JOIN customer_product_edges e ON e.other_customer = b.to_cust
+    WHERE b.hops < 5
+      AND EXISTS (SELECT 1 FROM forward_reach f  -- ← MUTUAL REFERENCE
+                  WHERE f.from_cust = b.from_cust)
+  )
+SELECT ... FROM forward_reach f JOIN backward_reach b ...`}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      {/* Influence Scores Tab */}
+      {activeTab === 'influence' && (
+        <div className="space-y-6">
+          {/* Explanation */}
+          <div className="bg-gradient-to-r from-amber-50 to-orange-50 rounded-lg p-4 border border-amber-200">
+            <div className="flex items-start gap-3">
+              <TrendingUp className="h-6 w-6 text-amber-600 mt-1" />
+              <div>
+                <h3 className="font-semibold text-amber-900">PageRank-Style Mutual Scoring</h3>
+                <p className="text-sm text-amber-700 mt-1">
+                  Computes influence scores where <strong>customer scores depend on product scores</strong> and vice versa.
+                  Uses two CTEs (<code className="mx-1 bg-amber-100 px-1 rounded">customer_score</code> and
+                  <code className="ml-1 bg-amber-100 px-1 rounded">product_score</code>) that iterate together until convergence.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Filter */}
+          <div className="flex gap-4">
+            <select
+              value={influenceTypeFilter}
+              onChange={(e) => setInfluenceTypeFilter(e.target.value)}
+              className="px-3 py-2 border border-gray-300 rounded-md text-sm"
+            >
+              <option value="">All Entities</option>
+              <option value="customer">Customers Only</option>
+              <option value="product">Products Only</option>
+            </select>
+            <button
+              onClick={() => refetchInfluence()}
+              className="px-3 py-2 bg-gray-100 hover:bg-gray-200 rounded-md flex items-center gap-2"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </button>
+          </div>
+
+          {/* Side by Side Comparison */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Customer Scores */}
+            <div className="bg-white rounded-lg shadow">
+              <div className="px-4 py-3 border-b border-gray-200 bg-amber-50">
+                <div className="flex items-center gap-2">
+                  <User className="h-5 w-5 text-amber-600" />
+                  <h2 className="text-lg font-semibold text-amber-900">Customer Influence</h2>
+                </div>
+                <p className="text-sm text-amber-700">Derived from products they purchase</p>
+              </div>
+              <div className="p-4">
+                {influenceLoading ? (
+                  <p className="text-gray-500">Computing influence scores...</p>
+                ) : customerScores.length === 0 ? (
+                  <p className="text-gray-500 text-center py-4">No customer scores available</p>
+                ) : (
+                  <div className="space-y-3">
+                    {customerScores.slice(0, 10).map((score, idx) => (
+                      <div key={score.entity_id} className="flex items-center gap-3">
+                        <span className="text-sm font-medium text-gray-400 w-6">{idx + 1}</span>
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-sm font-mono">{score.entity_id}</span>
+                            <span className="text-sm font-bold text-amber-600">
+                              {score.influence_score.toFixed(4)}
+                            </span>
+                          </div>
+                          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-amber-500 rounded-full"
+                              style={{
+                                width: `${Math.min(100, score.influence_score * 100)}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Product Scores */}
+            <div className="bg-white rounded-lg shadow">
+              <div className="px-4 py-3 border-b border-gray-200 bg-orange-50">
+                <div className="flex items-center gap-2">
+                  <Package className="h-5 w-5 text-orange-600" />
+                  <h2 className="text-lg font-semibold text-orange-900">Product Quality</h2>
+                </div>
+                <p className="text-sm text-orange-700">Derived from customers who purchase them</p>
+              </div>
+              <div className="p-4">
+                {influenceLoading ? (
+                  <p className="text-gray-500">Computing quality scores...</p>
+                ) : productScores.length === 0 ? (
+                  <p className="text-gray-500 text-center py-4">No product scores available</p>
+                ) : (
+                  <div className="space-y-3">
+                    {productScores.slice(0, 10).map((score, idx) => (
+                      <div key={score.entity_id} className="flex items-center gap-3">
+                        <span className="text-sm font-medium text-gray-400 w-6">{idx + 1}</span>
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-sm font-mono">{score.entity_id}</span>
+                            <span className="text-sm font-bold text-orange-600">
+                              {score.influence_score.toFixed(4)}
+                            </span>
+                          </div>
+                          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-orange-500 rounded-full"
+                              style={{
+                                width: `${Math.min(100, score.influence_score * 100)}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Algorithm Explanation */}
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h3 className="font-medium mb-2">PageRank-Style Mutual Recursion</h3>
+            <pre className="text-xs bg-gray-800 text-green-400 p-3 rounded overflow-x-auto">
+{`WITH MUTUALLY RECURSIVE
+  customer_score(customer_id, score, iteration) AS (
+    -- Base: equal initial scores
+    SELECT customer_id, 1.0 / COUNT(*) OVER (), 0 FROM customers
+    UNION
+    -- Recursive: score from products purchased
+    SELECT cs.customer_id,
+           0.15 + 0.85 * AVG(ps.score),  -- PageRank damping
+           cs.iteration + 1
+    FROM customer_score cs
+    JOIN purchases p ON p.customer_id = cs.customer_id
+    JOIN product_score ps ON ps.product_id = p.product_id  -- ← MUTUAL REFERENCE
+    WHERE cs.iteration < 10
+    GROUP BY cs.customer_id, cs.iteration
+  ),
+  product_score(product_id, score, iteration) AS (
+    -- Base: equal initial scores
+    SELECT product_id, 1.0 / COUNT(*) OVER (), 0 FROM products
+    UNION
+    -- Recursive: score from customers who purchased
+    SELECT ps.product_id,
+           0.15 + 0.85 * AVG(cs.score),  -- PageRank damping
+           ps.iteration + 1
+    FROM product_score ps
+    JOIN purchases p ON p.product_id = ps.product_id
+    JOIN customer_score cs ON cs.customer_id = p.customer_id  -- ← MUTUAL REFERENCE
+    WHERE ps.iteration < 10
+    GROUP BY ps.product_id, ps.iteration
+  )
+SELECT * FROM customer_score WHERE iteration = 10 ...`}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      {/* Delivery Bundles Tab */}
+      {activeTab === 'bundles' && (
+        <div className="space-y-6">
+          {/* Explanation */}
+          <div className="bg-gradient-to-r from-cyan-50 to-blue-50 rounded-lg p-4 border border-cyan-200">
+            <div className="flex items-start gap-3">
+              <Layers className="h-6 w-6 text-cyan-600 mt-1" />
+              <div>
+                <h3 className="font-semibold text-cyan-900">Delivery Bundle Conflict Detection</h3>
+                <p className="text-sm text-cyan-700 mt-1">
+                  Finds orders that can be bundled for delivery and detects inventory conflicts.
+                  Uses mutually recursive CTEs where <code className="mx-1 bg-cyan-100 px-1 rounded">bundle_candidates</code>
+                  excludes pairs from <code className="bg-cyan-100 px-1 rounded">inventory_conflicts</code>, which itself
+                  expands through bundles.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-4 gap-4">
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-cyan-600 mb-2">
+                <Layers className="h-5 w-5" />
+                <span className="font-medium">Total Bundles</span>
+              </div>
+              <p className="text-3xl font-bold">{totalBundles}</p>
+              <p className="text-sm text-gray-500">order pairs found</p>
+            </div>
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-green-600 mb-2">
+                <CheckCircle className="h-5 w-5" />
+                <span className="font-medium">No Conflict</span>
+              </div>
+              <p className="text-3xl font-bold">{totalBundles - conflictCount}</p>
+              <p className="text-sm text-gray-500">safe to bundle</p>
+            </div>
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-red-600 mb-2">
+                <AlertCircle className="h-5 w-5" />
+                <span className="font-medium">Conflicts</span>
+              </div>
+              <p className="text-3xl font-bold">{conflictCount}</p>
+              <p className="text-sm text-gray-500">inventory issues</p>
+            </div>
+            <div className="bg-white rounded-lg shadow p-4">
+              <div className="flex items-center gap-2 text-blue-600 mb-2">
+                <Store className="h-5 w-5" />
+                <span className="font-medium">Stores</span>
+              </div>
+              <p className="text-3xl font-bold">{stores?.length || 0}</p>
+              <p className="text-sm text-gray-500">with bundles</p>
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div className="flex gap-4">
+            <select
+              value={bundleStoreFilter}
+              onChange={(e) => setBundleStoreFilter(e.target.value)}
+              className="px-3 py-2 border border-gray-300 rounded-md text-sm"
+            >
+              <option value="">All Stores</option>
+              {stores?.map((store) => (
+                <option key={store.store_id} value={store.store_id}>
+                  {store.store_name}
+                </option>
+              ))}
+            </select>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={showConflictsOnly}
+                onChange={(e) => setShowConflictsOnly(e.target.checked)}
+                className="rounded border-gray-300 text-red-600 focus:ring-red-500"
+              />
+              <span className="text-sm">Show conflicts only</span>
+            </label>
+            <button
+              onClick={() => refetchBundles()}
+              className="px-3 py-2 bg-gray-100 hover:bg-gray-200 rounded-md flex items-center gap-2"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </button>
+          </div>
+
+          {/* Bundles Table */}
+          <div className="bg-white rounded-lg shadow">
+            <div className="px-4 py-3 border-b border-gray-200">
+              <h2 className="text-lg font-semibold">Delivery Bundle Analysis</h2>
+            </div>
+            <div className="overflow-x-auto">
+              {bundlesLoading ? (
+                <div className="p-4 text-gray-500">Analyzing delivery bundles...</div>
+              ) : bundles?.length === 0 ? (
+                <div className="p-8 text-center text-gray-500">
+                  <Layers className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                  <p>No bundles found</p>
+                  <p className="text-sm">Orders need shared stores and time windows to bundle</p>
+                </div>
+              ) : (
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Order A</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Order B</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Store</th>
+                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Bundle Size</th>
+                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Status</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Conflict Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {bundles?.map((bundle, idx) => (
+                      <tr
+                        key={idx}
+                        className={`hover:bg-gray-50 ${bundle.has_conflict ? 'bg-red-50' : ''}`}
+                      >
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="flex items-center gap-2">
+                            <ShoppingCart className="h-4 w-4 text-cyan-500" />
+                            <span className="text-sm font-mono">{bundle.order_a}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="flex items-center gap-2">
+                            <ShoppingCart className="h-4 w-4 text-blue-500" />
+                            <span className="text-sm font-mono">{bundle.order_b}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="flex items-center gap-2">
+                            <Store className="h-4 w-4 text-gray-400" />
+                            <span className="text-sm font-mono">{bundle.store_id}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-center">
+                          <span className="inline-flex items-center justify-center h-6 w-6 bg-gray-100 rounded-full text-sm font-medium">
+                            {bundle.bundle_size}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-center">
+                          {bundle.has_conflict ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-1 bg-red-100 text-red-800 rounded-full text-xs font-medium">
+                              <AlertCircle className="h-3 w-3" />
+                              CONFLICT
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 text-green-800 rounded-full text-xs font-medium">
+                              <CheckCircle className="h-3 w-3" />
+                              OK
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-500">
+                          {bundle.has_conflict && bundle.conflict_product ? (
+                            <span className="text-red-600">
+                              {bundle.conflict_product}: need {bundle.total_needed}, have {bundle.available_stock}
+                            </span>
+                          ) : (
+                            <span className="text-gray-400">-</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Algorithm Explanation */}
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h3 className="font-medium mb-2">Conflict Detection via Mutual Recursion</h3>
+            <pre className="text-xs bg-gray-800 text-green-400 p-3 rounded overflow-x-auto">
+{`WITH MUTUALLY RECURSIVE
+  bundle_candidates(order_a, order_b, store_id, size) AS (
+    -- Base: orders from same store, overlapping windows
+    SELECT o1.order_id, o2.order_id, o1.store_id, 2
+    FROM orders o1 JOIN orders o2 ON o1.store_id = o2.store_id
+    WHERE o1.order_id < o2.order_id
+      AND o1.delivery_window && o2.delivery_window
+      AND NOT EXISTS (  -- ← MUTUAL REFERENCE: exclude conflicts
+          SELECT 1 FROM inventory_conflicts ic
+          WHERE ic.order_a = o1.order_id AND ic.order_b = o2.order_id
+      )
+    ...
+  ),
+  inventory_conflicts(order_a, order_b, product, needed, available) AS (
+    -- Base: direct conflicts
+    SELECT bc.order_a, bc.order_b, li.product_id, total_qty, stock
+    FROM bundle_candidates bc  -- ← MUTUAL REFERENCE: check bundles
+    JOIN line_items li ON li.order_id IN (bc.order_a, bc.order_b)
+    JOIN inventory i ON i.store_id = bc.store_id AND i.product_id = li.product_id
+    WHERE total_qty > stock
+    UNION
+    -- Recursive: conflicts propagate through bundles
+    SELECT bc.order_a, bc.order_b, ic.product, ic.needed, ic.available
+    FROM inventory_conflicts ic
+    JOIN bundle_candidates bc ON bc.order_b = ic.order_a  -- ← MUTUAL REFERENCE
+  )
+SELECT * FROM bundle_candidates bc LEFT JOIN inventory_conflicts ic ...`}
+            </pre>
+          </div>
+        </div>
+      )}
 
       {/* Risk Propagation Tab */}
       {activeTab === 'risk' && (

@@ -425,6 +425,34 @@ export interface OrderFulfillmentAnalysis {
   fulfillable_products: number
 }
 
+// Advanced Graph Algorithm Types (Mutually Recursive)
+export interface CustomerCohort {
+  customer_a: string
+  customer_b: string
+  min_distance: number
+  forward_hops: number
+  backward_hops: number
+  connection_type: string
+}
+
+export interface InfluenceScore {
+  entity_type: string  // 'customer' or 'product'
+  entity_id: string
+  influence_score: number
+  iterations: number
+}
+
+export interface DeliveryBundle {
+  order_a: string
+  order_b: string
+  store_id: string
+  bundle_size: number
+  has_conflict: boolean
+  conflict_product: string | null
+  available_stock: number | null
+  total_needed: number | null
+}
+
 export const graphApi = {
   // Supply chain risk propagation
   listRisks: (params?: { entity_type?: string; risk_level?: string; limit?: number }) =>
@@ -441,6 +469,18 @@ export const graphApi = {
   // Order fulfillment analysis
   analyzeOrderFulfillment: (orderId: string) =>
     apiClient.get<OrderFulfillmentAnalysis>(`/freshmart/graph/order-fulfillment/${encodeURIComponent(orderId)}`),
+
+  // Customer cohorts (bidirectional reachability / SCC-like)
+  listCustomerCohorts: (params?: { customer_id?: string; limit?: number }) =>
+    apiClient.get<CustomerCohort[]>('/freshmart/graph/customer-cohorts', { params }),
+
+  // Influence scores (PageRank-style mutual scoring)
+  listInfluenceScores: (params?: { entity_type?: string; limit?: number }) =>
+    apiClient.get<InfluenceScore[]>('/freshmart/graph/influence-scores', { params }),
+
+  // Delivery bundles with conflict detection
+  listDeliveryBundles: (params?: { store_id?: string; show_conflicts?: boolean; limit?: number }) =>
+    apiClient.get<DeliveryBundle[]>('/freshmart/graph/delivery-bundles', { params }),
 }
 
 export const queryStatsApi = {

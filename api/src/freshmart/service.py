@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.freshmart.models import (
     CourierAvailable,
     CourierSchedule,
+    CustomerCohort,
+    DeliveryBundle,
+    InfluenceScore,
     OrderAwaitingCourier,
     OrderFilter,
     OrderFlat,
@@ -966,3 +969,165 @@ class FreshMartService:
             total_products=len(rows),
             fulfillable_products=len(rows) - len(missing_products),
         )
+
+    # =========================================================================
+    # Advanced Graph Algorithms (Mutually Recursive)
+    # =========================================================================
+
+    async def list_customer_cohorts(
+        self,
+        customer_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[CustomerCohort]:
+        """List customer cohorts from bidirectional reachability analysis.
+
+        Uses WITH MUTUALLY RECURSIVE with forward and backward CTEs that
+        reference each other to find strongly connected customer groups.
+
+        Args:
+            customer_id: Optional filter to show cohorts for a specific customer
+            limit: Maximum number of results
+
+        Returns:
+            List of customer pairs that are bidirectionally connected
+        """
+        conditions = []
+        params: dict = {"limit": limit}
+
+        if customer_id:
+            conditions.append("(customer_a = :customer_id OR customer_b = :customer_id)")
+            params["customer_id"] = customer_id
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT customer_a, customer_b, min_distance,
+                   forward_hops, backward_hops, connection_type
+            FROM customer_cohorts_mv
+            {where_clause}
+            ORDER BY min_distance, customer_a
+            LIMIT :limit
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            CustomerCohort(
+                customer_a=row.customer_a,
+                customer_b=row.customer_b,
+                min_distance=row.min_distance or 1,
+                forward_hops=row.forward_hops or 1,
+                backward_hops=row.backward_hops or 1,
+                connection_type=row.connection_type or "BIDIRECTIONAL",
+            )
+            for row in rows
+        ]
+
+    async def list_influence_scores(
+        self,
+        entity_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[InfluenceScore]:
+        """List influence scores from PageRank-style mutual scoring.
+
+        Uses WITH MUTUALLY RECURSIVE where customer_score and product_score
+        reference EACH OTHER - true mutual recursion like PageRank.
+
+        Args:
+            entity_type: Filter by 'customer' or 'product'
+            limit: Maximum number of results
+
+        Returns:
+            List of entities with their computed influence scores
+        """
+        conditions = []
+        params: dict = {"limit": limit}
+
+        if entity_type:
+            conditions.append("entity_type = :entity_type")
+            params["entity_type"] = entity_type
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT entity_type, entity_id, influence_score, iterations
+            FROM influence_network_mv
+            {where_clause}
+            ORDER BY influence_score DESC
+            LIMIT :limit
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            InfluenceScore(
+                entity_type=row.entity_type,
+                entity_id=row.entity_id,
+                influence_score=float(row.influence_score) if row.influence_score else 1.0,
+                iterations=row.iterations or 0,
+            )
+            for row in rows
+        ]
+
+    async def list_delivery_bundles(
+        self,
+        store_id: Optional[str] = None,
+        show_conflicts: Optional[bool] = None,
+        limit: int = 100,
+    ) -> list[DeliveryBundle]:
+        """List delivery bundles with conflict detection.
+
+        Uses WITH MUTUALLY RECURSIVE where bundle_candidates and
+        inventory_conflicts reference each other - bundles exclude
+        conflicting orders, and conflicts propagate through bundles.
+
+        Args:
+            store_id: Filter by store
+            show_conflicts: If True, only show bundles with conflicts.
+                           If False, only show bundles without conflicts.
+                           If None, show all.
+            limit: Maximum number of results
+
+        Returns:
+            List of order bundles with conflict information
+        """
+        conditions = []
+        params: dict = {"limit": limit}
+
+        if store_id:
+            conditions.append("store_id = :store_id")
+            params["store_id"] = store_id
+        if show_conflicts is True:
+            conditions.append("has_conflict = TRUE")
+        elif show_conflicts is False:
+            conditions.append("has_conflict = FALSE")
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT order_a, order_b, store_id, bundle_size,
+                   has_conflict, conflict_product, available_stock, total_needed
+            FROM delivery_bundles_mv
+            {where_clause}
+            ORDER BY store_id, bundle_size DESC, order_a
+            LIMIT :limit
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            DeliveryBundle(
+                order_a=row.order_a,
+                order_b=row.order_b,
+                store_id=row.store_id,
+                bundle_size=row.bundle_size or 2,
+                has_conflict=row.has_conflict or False,
+                conflict_product=row.conflict_product,
+                available_stock=row.available_stock,
+                total_needed=row.total_needed,
+            )
+            for row in rows
+        ]

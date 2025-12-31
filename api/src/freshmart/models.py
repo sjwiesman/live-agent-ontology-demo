@@ -307,3 +307,53 @@ class OrderFulfillmentAnalysis(BaseModel):
     split_options: list[SplitFulfillmentOption] = Field(default_factory=list)
     total_products: int = 0
     fulfillable_products: int = 0
+
+
+# =============================================================================
+# Advanced Graph Algorithm Models (Mutually Recursive)
+# =============================================================================
+
+
+class CustomerCohort(BaseModel):
+    """Customer cohort from bidirectional reachability analysis.
+
+    Two customers are in the same cohort if they can reach each other
+    through shared purchase patterns (strongly connected).
+    """
+
+    customer_a: str
+    customer_b: str
+    min_distance: int  # Minimum hops between them
+    forward_hops: int  # Hops from A to B
+    backward_hops: int  # Hops from B to A
+    connection_type: str = "BIDIRECTIONAL"
+
+
+class InfluenceScore(BaseModel):
+    """Influence score from PageRank-style mutual scoring.
+
+    Customer influence depends on product quality, and product quality
+    depends on customer influence - computed through mutual recursion.
+    """
+
+    entity_type: str  # 'customer' or 'product'
+    entity_id: str
+    influence_score: float
+    iterations: int  # Number of iterations to converge
+
+
+class DeliveryBundle(BaseModel):
+    """Delivery bundle with conflict detection.
+
+    Shows orders that can be bundled together, and detects inventory
+    conflicts where orders compete for scarce resources.
+    """
+
+    order_a: str
+    order_b: str
+    store_id: str
+    bundle_size: int
+    has_conflict: bool = False
+    conflict_product: Optional[str] = None
+    available_stock: Optional[int] = None
+    total_needed: Optional[int] = None

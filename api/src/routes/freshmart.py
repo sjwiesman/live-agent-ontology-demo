@@ -13,6 +13,9 @@ from src.freshmart.models import (
     CourierAvailable,
     CourierSchedule,
     CustomerInfo,
+    DeliveryBundle,
+    DeliveryBundleEnriched,
+    DeliveryBundleStats,
     OrderAtomicUpdate,
     OrderAwaitingCourier,
     OrderFieldsUpdate,
@@ -558,3 +561,87 @@ async def list_store_courier_metrics(
     - Courier utilization percentage
     """
     return await service.list_store_courier_metrics(store_id=store_id)
+
+
+# =============================================================================
+# Delivery Bundles (Mutual Recursion Demo)
+# =============================================================================
+
+
+@router.get("/delivery-bundles", response_model=list[DeliveryBundle])
+async def list_delivery_bundles(
+    store_id: Optional[str] = Query(default=None, description="Filter by store"),
+    has_conflict: Optional[bool] = Query(default=None, description="Filter by conflict status"),
+    min_bundle_size: int = Query(default=2, ge=2, le=5, description="Minimum bundle size"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List delivery bundles computed using Materialize's WITH MUTUALLY RECURSIVE.
+
+    This endpoint demonstrates a powerful feature unique to Materialize:
+    mutual recursion between CTEs. Standard SQL's WITH RECURSIVE only allows
+    a CTE to reference itself, not other CTEs.
+
+    The algorithm finds orders that can be bundled for delivery while detecting
+    inventory conflicts - and these two computations depend on each other.
+
+    Filters:
+    - store_id: Filter by store
+    - has_conflict: Filter by conflict status (true/false)
+    - min_bundle_size: Minimum number of orders in bundle (2-5)
+    """
+    return await service.list_delivery_bundles(
+        store_id=store_id,
+        has_conflict=has_conflict,
+        min_bundle_size=min_bundle_size,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/delivery-bundles/enriched", response_model=list[DeliveryBundleEnriched])
+async def list_delivery_bundles_enriched(
+    store_id: Optional[str] = Query(default=None, description="Filter by store"),
+    has_conflict: Optional[bool] = Query(default=None, description="Filter by conflict status"),
+    min_bundle_size: int = Query(default=2, ge=2, le=5, description="Minimum bundle size"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    List delivery bundles with enriched order and store details.
+
+    Returns bundles with additional information:
+    - Order numbers and customer names for both orders
+    - Order totals
+    - Store name and zone
+    - Conflict product name (if applicable)
+    """
+    return await service.list_delivery_bundles_enriched(
+        store_id=store_id,
+        has_conflict=has_conflict,
+        min_bundle_size=min_bundle_size,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/delivery-bundles/stats", response_model=DeliveryBundleStats)
+async def get_delivery_bundle_stats(
+    store_id: Optional[str] = Query(default=None, description="Filter by store"),
+    service: FreshMartService = Depends(get_freshmart_service),
+):
+    """
+    Get aggregated statistics for delivery bundles.
+
+    Returns:
+    - Total number of potential bundles
+    - Valid bundles (no inventory conflicts)
+    - Conflicted bundles
+    - Maximum bundle size found
+    - Number of stores with bundling opportunities
+    - Estimated delivery cost savings percentage
+    """
+    return await service.get_delivery_bundle_stats(store_id=store_id)

@@ -294,3 +294,153 @@ CREATE INDEX IF NOT EXISTS orders_search_source_idx IN CLUSTER serving ON orders
 CREATE INDEX IF NOT EXISTS courier_schedule_idx IN CLUSTER serving ON courier_schedule_mv (courier_id);
 CREATE INDEX IF NOT EXISTS stores_idx IN CLUSTER serving ON stores_mv (store_id);
 CREATE INDEX IF NOT EXISTS customers_idx IN CLUSTER serving ON customers_mv (customer_id);
+
+
+-- =============================================================================
+-- DELIVERY BUNDLING WITH MUTUAL RECURSION
+-- =============================================================================
+-- Demonstrates Materialize's WITH MUTUALLY RECURSIVE - a capability that goes
+-- beyond standard SQL recursive CTEs and implements true Datalog semantics.
+--
+-- KEY INSIGHT: Standard SQL WITH RECURSIVE only allows self-reference.
+-- Materialize allows multiple CTEs to reference EACH OTHER simultaneously.
+--
+-- This algorithm finds orders that can be bundled for delivery while detecting
+-- inventory conflicts that would prevent bundling - and these two computations
+-- depend on each other in a way that requires mutual recursion.
+-- =============================================================================
+
+-- Order lines flat view needed for delivery bundling
+CREATE VIEW IF NOT EXISTS order_lines_flat AS
+SELECT
+    subject_id AS line_id,
+    MAX(CASE WHEN predicate = 'line_of_order' THEN object_value END) AS order_id,
+    MAX(CASE WHEN predicate = 'line_product' THEN object_value END) AS product_id,
+    MAX(CASE WHEN predicate = 'line_quantity' THEN object_value END)::INT AS quantity,
+    MAX(CASE WHEN predicate = 'line_unit_price' THEN object_value END)::DECIMAL(10,2) AS unit_price,
+    MAX(CASE WHEN predicate = 'line_amount' THEN object_value END)::DECIMAL(10,2) AS line_amount,
+    MAX(updated_at) AS effective_updated_at
+FROM triples
+WHERE subject_id LIKE 'line:%'
+GROUP BY subject_id;
+
+-- Delivery bundles with conflict detection using mutual recursion
+CREATE MATERIALIZED VIEW IF NOT EXISTS delivery_bundles_mv IN CLUSTER compute AS
+WITH MUTUALLY RECURSIVE
+    -- =========================================================================
+    -- CTE 1: INVENTORY CONFLICTS
+    -- Orders that compete for the same scarce inventory
+    -- REFERENCES: bundle_candidates (for transitive conflict propagation)
+    -- =========================================================================
+    inventory_conflicts(order_a TEXT, order_b TEXT, product_id TEXT, available_stock INT, total_needed INT) AS (
+        -- Base case: direct conflicts
+        -- Two orders want the same product but store doesn't have enough for both
+        SELECT
+            ol1.order_id AS order_a,
+            ol2.order_id AS order_b,
+            ol1.product_id,
+            inv.stock_level AS available_stock,
+            (ol1.quantity + ol2.quantity)::INT AS total_needed
+        FROM order_lines_flat ol1
+        JOIN order_lines_flat ol2
+            ON ol1.product_id = ol2.product_id
+            AND ol1.order_id < ol2.order_id  -- Avoid duplicates
+        JOIN orders_flat_mv o1 ON o1.order_id = ol1.order_id
+        JOIN orders_flat_mv o2 ON o2.order_id = ol2.order_id
+        JOIN store_inventory_mv inv
+            ON inv.product_id = ol1.product_id
+            AND inv.store_id = o1.store_id
+        WHERE o1.store_id = o2.store_id           -- Same store
+            AND o1.order_status = 'CREATED'        -- Only active orders
+            AND o2.order_status = 'CREATED'
+            AND inv.stock_level < (ol1.quantity + ol2.quantity)  -- NOT ENOUGH!
+
+        UNION
+
+        -- Transitive conflicts: if A conflicts with B, and B is bundled with C,
+        -- then the conflict propagates to affect A-C relationship too!
+        --
+        -- THIS IS THE MUTUAL REFERENCE: conflicts depend on bundles
+        SELECT DISTINCT
+            ic.order_a,
+            bc.order_b,
+            ic.product_id,
+            ic.available_stock,
+            ic.total_needed
+        FROM inventory_conflicts ic
+        JOIN bundle_candidates bc ON bc.order_a = ic.order_b
+        WHERE ic.order_a != bc.order_b
+            AND ic.available_stock < ic.total_needed
+    ),
+
+    -- =========================================================================
+    -- CTE 2: BUNDLE CANDIDATES
+    -- Orders that can potentially be delivered together
+    -- REFERENCES: inventory_conflicts (to exclude conflicting pairs)
+    -- =========================================================================
+    bundle_candidates(order_a TEXT, order_b TEXT, store_id TEXT, bundle_size INT) AS (
+        -- Base case: pairs of orders that could be bundled
+        SELECT
+            o1.order_id AS order_a,
+            o2.order_id AS order_b,
+            o1.store_id,
+            2 AS bundle_size
+        FROM orders_flat_mv o1
+        JOIN orders_flat_mv o2
+            ON o1.store_id = o2.store_id
+            AND o1.order_id < o2.order_id
+            AND o1.order_status = 'CREATED'
+            AND o2.order_status = 'CREATED'
+        -- Time windows must overlap (can deliver together)
+        WHERE o1.delivery_window_start::timestamptz <= o2.delivery_window_end::timestamptz
+            AND o1.delivery_window_end::timestamptz >= o2.delivery_window_start::timestamptz
+        -- THIS IS THE MUTUAL REFERENCE: bundles exclude conflicts
+        AND NOT EXISTS (
+            SELECT 1 FROM inventory_conflicts ic
+            WHERE ic.order_a = o1.order_id AND ic.order_b = o2.order_id
+        )
+
+        UNION
+
+        -- Extend bundles: grow the bundle by adding more orders
+        SELECT DISTINCT
+            bc.order_a,
+            o.order_id AS order_b,
+            bc.store_id,
+            bc.bundle_size + 1
+        FROM bundle_candidates bc
+        JOIN orders_flat_mv o
+            ON o.store_id = bc.store_id
+            AND o.order_id > bc.order_b
+            AND o.order_status = 'CREATED'
+        WHERE bc.bundle_size < 5  -- Max 5 orders per bundle
+            -- No conflicts with any existing order in the bundle
+            AND NOT EXISTS (
+                SELECT 1 FROM inventory_conflicts ic
+                WHERE (ic.order_a = bc.order_a AND ic.order_b = o.order_id)
+                   OR (ic.order_a = bc.order_b AND ic.order_b = o.order_id)
+            )
+    )
+-- Final output: all bundles with their conflict status
+SELECT
+    bc.order_a,
+    bc.order_b,
+    bc.store_id,
+    bc.bundle_size,
+    CASE WHEN ic.order_a IS NOT NULL THEN TRUE ELSE FALSE END AS has_conflict,
+    ic.product_id AS conflict_product,
+    ic.available_stock,
+    ic.total_needed
+FROM bundle_candidates bc
+LEFT JOIN inventory_conflicts ic
+    ON ic.order_a = bc.order_a AND ic.order_b = bc.order_b;
+
+-- Indexes for delivery bundles
+CREATE INDEX IF NOT EXISTS delivery_bundles_store_idx
+    IN CLUSTER serving ON delivery_bundles_mv (store_id);
+
+CREATE INDEX IF NOT EXISTS delivery_bundles_order_idx
+    IN CLUSTER serving ON delivery_bundles_mv (order_a);
+
+CREATE INDEX IF NOT EXISTS delivery_bundles_conflict_idx
+    IN CLUSTER serving ON delivery_bundles_mv (has_conflict);

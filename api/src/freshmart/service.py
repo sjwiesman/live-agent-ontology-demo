@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.freshmart.models import (
     CourierAvailable,
     CourierSchedule,
+    DeliveryBundle,
+    DeliveryBundleEnriched,
+    DeliveryBundleStats,
     OrderAwaitingCourier,
     OrderFilter,
     OrderFlat,
@@ -754,3 +757,219 @@ class FreshMartService:
             )
             for row in rows
         ]
+
+    # =========================================================================
+    # Delivery Bundles (Mutual Recursion Demo)
+    # =========================================================================
+
+    async def list_delivery_bundles(
+        self,
+        store_id: Optional[str] = None,
+        has_conflict: Optional[bool] = None,
+        min_bundle_size: int = 2,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[DeliveryBundle]:
+        """List delivery bundles from delivery_bundles_mv.
+
+        This view demonstrates Materialize's WITH MUTUALLY RECURSIVE feature,
+        computing bundleable orders while detecting inventory conflicts.
+
+        Args:
+            store_id: Optional filter by store
+            has_conflict: Optional filter by conflict status
+            min_bundle_size: Minimum bundle size (default 2)
+            limit: Maximum number of results
+            offset: Offset for pagination
+
+        Returns:
+            List of delivery bundles
+        """
+        conditions = []
+        params: dict = {"limit": limit, "offset": offset, "min_bundle_size": min_bundle_size}
+
+        if store_id:
+            conditions.append("store_id = :store_id")
+            params["store_id"] = store_id
+
+        if has_conflict is not None:
+            conditions.append("has_conflict = :has_conflict")
+            params["has_conflict"] = has_conflict
+
+        conditions.append("bundle_size >= :min_bundle_size")
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT order_a, order_b, store_id, bundle_size, has_conflict,
+                   conflict_product, available_stock, total_needed
+            FROM delivery_bundles_mv
+            {where_clause}
+            ORDER BY bundle_size DESC, store_id, order_a
+            LIMIT :limit OFFSET :offset
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            DeliveryBundle(
+                order_a=row.order_a,
+                order_b=row.order_b,
+                store_id=row.store_id,
+                bundle_size=row.bundle_size,
+                has_conflict=row.has_conflict or False,
+                conflict_product=row.conflict_product,
+                available_stock=row.available_stock,
+                total_needed=row.total_needed,
+            )
+            for row in rows
+        ]
+
+    async def list_delivery_bundles_enriched(
+        self,
+        store_id: Optional[str] = None,
+        has_conflict: Optional[bool] = None,
+        min_bundle_size: int = 2,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[DeliveryBundleEnriched]:
+        """List delivery bundles with enriched order and store details.
+
+        Joins the delivery bundles view with order and store information
+        to provide a complete picture for the UI.
+
+        Args:
+            store_id: Optional filter by store
+            has_conflict: Optional filter by conflict status
+            min_bundle_size: Minimum bundle size (default 2)
+            limit: Maximum number of results
+            offset: Offset for pagination
+
+        Returns:
+            List of enriched delivery bundles
+        """
+        conditions = []
+        params: dict = {"limit": limit, "offset": offset, "min_bundle_size": min_bundle_size}
+
+        if store_id:
+            conditions.append("db.store_id = :store_id")
+            params["store_id"] = store_id
+
+        if has_conflict is not None:
+            conditions.append("db.has_conflict = :has_conflict")
+            params["has_conflict"] = has_conflict
+
+        conditions.append("db.bundle_size >= :min_bundle_size")
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT
+                db.order_a,
+                db.order_b,
+                db.store_id,
+                db.bundle_size,
+                db.has_conflict,
+                db.conflict_product,
+                db.available_stock,
+                db.total_needed,
+                oa.order_number AS order_a_number,
+                ob.order_number AS order_b_number,
+                ca.customer_name AS order_a_customer,
+                cb.customer_name AS order_b_customer,
+                oa.order_total_amount AS order_a_total,
+                ob.order_total_amount AS order_b_total,
+                s.store_name,
+                s.store_zone,
+                p.product_name AS conflict_product_name
+            FROM delivery_bundles_mv db
+            LEFT JOIN orders_flat_mv oa ON oa.order_id = db.order_a
+            LEFT JOIN orders_flat_mv ob ON ob.order_id = db.order_b
+            LEFT JOIN customers_flat ca ON ca.customer_id = oa.customer_id
+            LEFT JOIN customers_flat cb ON cb.customer_id = ob.customer_id
+            LEFT JOIN stores_flat s ON s.store_id = db.store_id
+            LEFT JOIN products_flat p ON p.product_id = db.conflict_product
+            {where_clause}
+            ORDER BY db.bundle_size DESC, db.store_id, db.order_a
+            LIMIT :limit OFFSET :offset
+        """
+
+        result = await self.session.execute(text(query), params)
+        rows = result.fetchall()
+
+        return [
+            DeliveryBundleEnriched(
+                order_a=row.order_a,
+                order_b=row.order_b,
+                store_id=row.store_id,
+                bundle_size=row.bundle_size,
+                has_conflict=row.has_conflict or False,
+                conflict_product=row.conflict_product,
+                available_stock=row.available_stock,
+                total_needed=row.total_needed,
+                order_a_number=row.order_a_number,
+                order_b_number=row.order_b_number,
+                order_a_customer=row.order_a_customer,
+                order_b_customer=row.order_b_customer,
+                order_a_total=row.order_a_total,
+                order_b_total=row.order_b_total,
+                store_name=row.store_name,
+                store_zone=row.store_zone,
+                conflict_product_name=row.conflict_product_name,
+            )
+            for row in rows
+        ]
+
+    async def get_delivery_bundle_stats(
+        self,
+        store_id: Optional[str] = None,
+    ) -> DeliveryBundleStats:
+        """Get aggregated statistics for delivery bundles.
+
+        Args:
+            store_id: Optional filter by store
+
+        Returns:
+            Aggregated bundle statistics
+        """
+        conditions = []
+        params: dict = {}
+
+        if store_id:
+            conditions.append("store_id = :store_id")
+            params["store_id"] = store_id
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        query = f"""
+            SELECT
+                COUNT(*) AS total_bundles,
+                COUNT(*) FILTER (WHERE has_conflict = FALSE) AS valid_bundles,
+                COUNT(*) FILTER (WHERE has_conflict = TRUE) AS conflicted_bundles,
+                COALESCE(MAX(bundle_size), 0) AS max_bundle_size,
+                COUNT(DISTINCT store_id) AS stores_with_bundles
+            FROM delivery_bundles_mv
+            {where_clause}
+        """
+
+        result = await self.session.execute(text(query), params)
+        row = result.fetchone()
+
+        if not row:
+            return DeliveryBundleStats()
+
+        # Calculate potential savings percentage
+        # Assume each bundle saves ~20% delivery cost compared to separate deliveries
+        total = row.total_bundles or 0
+        valid = row.valid_bundles or 0
+        potential_savings = (valid / max(total, 1)) * 20.0 if total > 0 else 0
+
+        return DeliveryBundleStats(
+            total_bundles=total,
+            valid_bundles=valid,
+            conflicted_bundles=row.conflicted_bundles or 0,
+            max_bundle_size=row.max_bundle_size or 0,
+            stores_with_bundles=row.stores_with_bundles or 0,
+            potential_savings_pct=round(potential_savings, 1),
+        )

@@ -9,6 +9,7 @@ import {
   Network,
   TrendingUp,
   BarChart3,
+  Layers,
 } from 'lucide-react'
 
 import OntologyClassesPage from './pages/OntologyClassesPage'
@@ -20,6 +21,7 @@ import CouriersSchedulePage from './pages/CouriersSchedulePage'
 import SettingsPage from './pages/SettingsPage'
 import MetricsDashboardPage from './pages/MetricsDashboardPage'
 import QueryStatisticsPage from './pages/QueryStatisticsPage'
+import DeliveryBundlesPage from './pages/DeliveryBundlesPage'
 import { PropagationProvider } from './contexts/PropagationContext'
 import { ChatProvider } from './contexts/ChatContext'
 import PropagationWidget from './components/PropagationWidget'
@@ -31,6 +33,7 @@ const navItems = [
   { path: '/orders', icon: ShoppingCart, label: 'Orders' },
   { path: '/stores', icon: Warehouse, label: 'Stores & Inventory' },
   { path: '/couriers', icon: Truck, label: 'Couriers' },
+  { path: '/delivery-bundles', icon: Layers, label: 'Delivery Bundles' },
   { path: '/ontology/classes', icon: Database, label: 'Ontology Classes' },
   { path: '/ontology/properties', icon: Network, label: 'Properties' },
   { path: '/triples', icon: Package, label: 'Triples Browser' },
@@ -77,6 +80,7 @@ function App() {
                 <Route path="/orders" element={<OrdersDashboardPage />} />
                 <Route path="/stores" element={<StoresInventoryPage />} />
                 <Route path="/couriers" element={<CouriersSchedulePage />} />
+                <Route path="/delivery-bundles" element={<DeliveryBundlesPage />} />
                 <Route path="/ontology/classes" element={<OntologyClassesPage />} />
                 <Route path="/ontology/properties" element={<OntologyPropertiesPage />} />
                 <Route path="/triples" element={<TriplesBrowserPage />} />

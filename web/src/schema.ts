@@ -232,6 +232,21 @@ const store_capacity_health_mv = table('store_capacity_health_mv')
   })
   .primaryKey('store_id')
 
+// delivery_bundles_mv - delivery bundling with mutual recursion
+// Demonstrates Materialize's WITH MUTUALLY RECURSIVE capability
+const delivery_bundles_mv = table('delivery_bundles_mv')
+  .columns({
+    order_a: string(),
+    order_b: string(),
+    store_id: string().optional(),
+    bundle_size: number().optional(),
+    has_conflict: boolean().optional(),
+    conflict_product: string().optional(),
+    available_stock: number().optional(),
+    total_needed: number().optional(),
+  })
+  .primaryKey(['order_a', 'order_b'])
+
 // Define relationships
 const storeRelationships = relationships(stores_mv, ({ many }) => ({
   inventory: many({
@@ -268,7 +283,7 @@ const inventoryRelationships = relationships(store_inventory_mv, ({ one }) => ({
 }))
 
 export const schema = createSchema({
-  tables: [orders_search_source_mv, orders_with_lines_mv, stores_mv, store_inventory_mv, courier_schedule_mv, customers_mv, products_mv, inventory_items_with_dynamic_pricing, pricing_yield_mv, inventory_risk_mv, store_capacity_health_mv],
+  tables: [orders_search_source_mv, orders_with_lines_mv, stores_mv, store_inventory_mv, courier_schedule_mv, customers_mv, products_mv, inventory_items_with_dynamic_pricing, pricing_yield_mv, inventory_risk_mv, store_capacity_health_mv, delivery_bundles_mv],
   relationships: [storeRelationships, courierRelationships, orderWithLinesRelationships, inventoryRelationships],
 })
 
@@ -356,6 +371,14 @@ export const permissions = definePermissions<unknown, Schema>(schema, () => ({
     },
   },
   store_capacity_health_mv: {
+    row: {
+      select: ANYONE_CAN,
+      insert: NOBODY_CAN,
+      update: { preMutation: NOBODY_CAN },
+      delete: NOBODY_CAN,
+    },
+  },
+  delivery_bundles_mv: {
     row: {
       select: ANYONE_CAN,
       insert: NOBODY_CAN,

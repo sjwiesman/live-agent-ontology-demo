@@ -387,6 +387,48 @@ export interface TripleWriteRequest {
   object_value: string
 }
 
+// Delivery Bundles Types (Mutual Recursion Demo)
+export interface DeliveryBundle {
+  order_a: string
+  order_b: string
+  store_id: string | null
+  bundle_size: number
+  has_conflict: boolean
+  conflict_product: string | null
+  available_stock: number | null
+  total_needed: number | null
+}
+
+export interface DeliveryBundleEnriched extends DeliveryBundle {
+  order_a_number: string | null
+  order_b_number: string | null
+  order_a_customer: string | null
+  order_b_customer: string | null
+  order_a_total: number | null
+  order_b_total: number | null
+  store_name: string | null
+  store_zone: string | null
+  conflict_product_name: string | null
+}
+
+export interface DeliveryBundleStats {
+  total_bundles: number
+  valid_bundles: number
+  conflicted_bundles: number
+  max_bundle_size: number
+  stores_with_bundles: number
+  potential_savings_pct: number | null
+}
+
+export const deliveryBundlesApi = {
+  listBundles: (params?: { store_id?: string; has_conflict?: boolean; min_bundle_size?: number; limit?: number }) =>
+    apiClient.get<DeliveryBundle[]>('/freshmart/delivery-bundles', { params }),
+  listBundlesEnriched: (params?: { store_id?: string; has_conflict?: boolean; min_bundle_size?: number; limit?: number }) =>
+    apiClient.get<DeliveryBundleEnriched[]>('/freshmart/delivery-bundles/enriched', { params }),
+  getStats: (params?: { store_id?: string }) =>
+    apiClient.get<DeliveryBundleStats>('/freshmart/delivery-bundles/stats', { params }),
+}
+
 export const queryStatsApi = {
   // Get orders for dropdown selection
   getOrders: () =>

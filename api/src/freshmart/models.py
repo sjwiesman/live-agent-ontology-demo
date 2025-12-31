@@ -257,3 +257,50 @@ class StoreCourierMetrics(BaseModel):
     estimated_wait_minutes: Optional[float] = None
     courier_utilization_pct: Optional[float] = None
     effective_updated_at: Optional[datetime] = None
+
+
+# =============================================================================
+# Delivery Bundles Models (Mutual Recursion Demo)
+# =============================================================================
+
+
+class DeliveryBundle(BaseModel):
+    """Delivery bundle from delivery_bundles_mv view.
+
+    Represents a potential bundle of orders that can be delivered together,
+    computed using Materialize's mutual recursion (WITH MUTUALLY RECURSIVE).
+    """
+
+    order_a: str
+    order_b: str
+    store_id: Optional[str] = None
+    bundle_size: int = 2
+    has_conflict: bool = False
+    conflict_product: Optional[str] = None
+    available_stock: Optional[int] = None
+    total_needed: Optional[int] = None
+
+
+class DeliveryBundleEnriched(DeliveryBundle):
+    """Enriched delivery bundle with order and store details."""
+
+    order_a_number: Optional[str] = None
+    order_b_number: Optional[str] = None
+    order_a_customer: Optional[str] = None
+    order_b_customer: Optional[str] = None
+    order_a_total: Optional[Decimal] = None
+    order_b_total: Optional[Decimal] = None
+    store_name: Optional[str] = None
+    store_zone: Optional[str] = None
+    conflict_product_name: Optional[str] = None
+
+
+class DeliveryBundleStats(BaseModel):
+    """Aggregated statistics for delivery bundles."""
+
+    total_bundles: int = 0
+    valid_bundles: int = 0
+    conflicted_bundles: int = 0
+    max_bundle_size: int = 0
+    stores_with_bundles: int = 0
+    potential_savings_pct: Optional[float] = None

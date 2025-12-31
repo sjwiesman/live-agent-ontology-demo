@@ -1,0 +1,87 @@
+-- =============================================================================
+-- DELIVERY BUNDLING WITH MUTUAL RECURSION
+-- =============================================================================
+-- Demonstrates Materialize's WITH MUTUALLY RECURSIVE - a capability that goes
+-- beyond standard SQL recursive CTEs and implements true Datalog semantics.
+--
+-- KEY INSIGHT: Standard SQL WITH RECURSIVE only allows self-reference.
+-- Materialize allows multiple CTEs to reference EACH OTHER simultaneously.
+--
+-- This algorithm finds orders that can be bundled for delivery while detecting
+-- inventory conflicts that would prevent bundling - and these two computations
+-- depend on each other in a way that requires mutual recursion.
+-- =============================================================================
+
+
+-- =============================================================================
+-- THE MUTUAL RECURSION PROBLEM
+-- =============================================================================
+--
+-- We want to find orders that can be bundled together, but:
+--   1. Orders can only be bundled if they don't have inventory conflicts
+--   2. Inventory conflicts can propagate THROUGH bundles
+--   3. Whether something is a valid bundle depends on conflicts
+--   4. Whether something is a conflict depends on bundles
+--
+-- This creates a chicken-and-egg problem that standard SQL cannot solve!
+--
+-- Datalog rules:
+--   can_bundle(O1, O2) :- same_store(O1, O2), compatible_time(O1, O2),
+--                         NOT has_conflict(O1, O2).
+--   can_bundle(O1, O3) :- can_bundle(O1, O2), can_bundle(O2, O3),
+--                         NOT has_conflict(O1, O3).
+--   has_conflict(O1, O2) :- shares_product(O1, O2, P), insufficient_stock(P).
+--   has_conflict(O1, O3) :- has_conflict(O1, O2), can_bundle(O2, O3).
+--
+-- Notice: can_bundle references has_conflict, has_conflict references can_bundle
+-- This is MUTUAL RECURSION - impossible in standard SQL!
+-- =============================================================================
+
+
+-- =============================================================================
+-- WHY THIS MATTERS
+-- =============================================================================
+--
+-- 1. STANDARD SQL CANNOT DO THIS
+--    WITH RECURSIVE only allows a CTE to reference itself, not other CTEs.
+--    You'd need multiple queries, application logic, or stored procedures.
+--
+-- 2. DATALOG SEMANTICS
+--    Materialize evaluates all CTEs together until reaching a fixed point.
+--    Changes ripple through automatically - if a bundle becomes invalid,
+--    all dependent computations update.
+--
+-- 3. INCREMENTAL MAINTENANCE
+--    As orders come in or inventory changes, Materialize incrementally
+--    updates the bundles and conflicts without recomputing everything.
+--
+-- 4. REAL-TIME CONSISTENCY
+--    The mutual recursion ensures bundles and conflicts are always
+--    consistent with each other - no race conditions or stale data.
+--
+-- =============================================================================
+
+
+-- =============================================================================
+-- EXAMPLE QUERIES (to be used with Materialize)
+-- =============================================================================
+--
+-- Find all valid bundles (no conflicts):
+--   SELECT * FROM delivery_bundles_mv
+--   WHERE has_conflict = FALSE
+--   ORDER BY store_id, bundle_size DESC;
+--
+-- Find bundles with inventory conflicts:
+--   SELECT * FROM delivery_bundles_mv
+--   WHERE has_conflict = TRUE;
+--
+-- Find the largest possible bundles:
+--   SELECT store_id, MAX(bundle_size) as max_bundle
+--   FROM delivery_bundles_mv
+--   WHERE has_conflict = FALSE
+--   GROUP BY store_id;
+--
+-- =============================================================================
+
+-- Note: The actual materialized view is created in Materialize (init_materialize.sql)
+-- This migration file serves as documentation for the feature.

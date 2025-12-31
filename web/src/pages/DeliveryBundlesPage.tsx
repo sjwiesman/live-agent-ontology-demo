@@ -16,6 +16,9 @@ import {
   Layers,
   Info,
   RefreshCw,
+  Clock,
+  User,
+  Wrench,
 } from "lucide-react";
 
 export default function DeliveryBundlesPage() {
@@ -66,12 +69,12 @@ export default function DeliveryBundlesPage() {
   // Calculate summary metrics from real-time data
   const realtimeMetrics = useMemo(() => {
     const total = bundlesData.length;
-    const valid = bundlesData.filter(b => !b.has_conflict).length;
-    const conflicted = bundlesData.filter(b => b.has_conflict).length;
+    const valid = bundlesData.filter(b => !b.has_inventory_conflict && !b.has_time_conflict).length;
+    const inventoryConflicts = bundlesData.filter(b => b.has_inventory_conflict).length;
+    const timeConflicts = bundlesData.filter(b => b.has_time_conflict).length;
     const maxSize = Math.max(...bundlesData.map(b => b.bundle_size || 2), 0);
-    const uniqueStores = new Set(bundlesData.map(b => b.store_id).filter(Boolean)).size;
 
-    return { total, valid, conflicted, maxSize, uniqueStores };
+    return { total, valid, inventoryConflicts, timeConflicts, maxSize };
   }, [bundlesData]);
 
   // Group bundles by store for visualization
@@ -86,6 +89,9 @@ export default function DeliveryBundlesPage() {
     }
     return grouped;
   }, [enrichedBundles]);
+
+  // Helper to check if bundle has any conflict
+  const hasAnyConflict = (b: DeliveryBundleEnriched) => b.has_inventory_conflict || b.has_time_conflict;
 
   return (
     <div className="p-6">
@@ -129,24 +135,39 @@ export default function DeliveryBundlesPage() {
             <Info className="h-5 w-5 text-indigo-600 mt-0.5 flex-shrink-0" />
             <div>
               <h3 className="font-semibold text-indigo-900 mb-2">
-                Materialize's WITH MUTUALLY RECURSIVE
+                Materialize's WITH MUTUALLY RECURSIVE (5 CTEs)
               </h3>
               <div className="text-sm text-gray-700 space-y-2">
                 <p>
-                  Standard SQL's <code className="px-1 bg-white rounded">WITH RECURSIVE</code> only allows a CTE to reference itself.
-                  Materialize extends this with <strong>mutual recursion</strong> where multiple CTEs can reference <em>each other</em>.
+                  This view uses <strong>5 mutually recursive CTEs</strong> that reference each other,
+                  demonstrating a capability impossible in standard SQL.
                 </p>
-                <p className="font-medium text-indigo-800">The chicken-and-egg problem:</p>
-                <ul className="list-disc list-inside ml-2 space-y-1">
-                  <li><strong>can_bundle(A, B)</strong> depends on <strong>has_conflict(A, B)</strong></li>
-                  <li><strong>has_conflict(A, B)</strong> depends on <strong>can_bundle(A, B)</strong></li>
-                </ul>
-                <p>
-                  This is impossible in standard SQL! Materialize implements true <strong>Datalog semantics</strong>,
-                  evaluating all CTEs together until reaching a fixed point.
-                </p>
-                <p className="text-indigo-700 font-medium">
-                  Benefits: Real-time consistency, incremental maintenance, and automatic propagation of changes.
+                <div className="grid grid-cols-2 gap-4 mt-3">
+                  <div className="bg-white/50 rounded p-2">
+                    <p className="font-medium text-indigo-800">1. inventory_conflicts</p>
+                    <p className="text-xs text-gray-600">Detects stock shortages, excludes resolved_conflicts</p>
+                  </div>
+                  <div className="bg-white/50 rounded p-2">
+                    <p className="font-medium text-indigo-800">2. time_conflicts</p>
+                    <p className="text-xs text-gray-600">Validates delivery windows, depends on bundle_candidates</p>
+                  </div>
+                  <div className="bg-white/50 rounded p-2">
+                    <p className="font-medium text-indigo-800">3. courier_compatible</p>
+                    <p className="text-xs text-gray-600">Finds available couriers, depends on bundle_candidates</p>
+                  </div>
+                  <div className="bg-white/50 rounded p-2">
+                    <p className="font-medium text-indigo-800">4. resolved_conflicts</p>
+                    <p className="text-xs text-gray-600">Tracks resolvable issues, depends on inventory_conflicts</p>
+                  </div>
+                </div>
+                <div className="bg-white/50 rounded p-2 mt-2">
+                  <p className="font-medium text-indigo-800">5. bundle_candidates</p>
+                  <p className="text-xs text-gray-600">
+                    The bundleable orders - depends on all 4 above, which also depend on it!
+                  </p>
+                </div>
+                <p className="text-indigo-700 font-medium mt-3">
+                  Materialize evaluates all CTEs together until reaching a fixed point - true Datalog semantics.
                 </p>
               </div>
             </div>
@@ -155,7 +176,7 @@ export default function DeliveryBundlesPage() {
       )}
 
       {/* Summary Statistics */}
-      <div className="grid grid-cols-5 gap-4 mb-6">
+      <div className="grid grid-cols-6 gap-4 mb-6">
         <div className="bg-white rounded-lg shadow p-4">
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-sm font-medium text-gray-500">Total Bundles</h3>
@@ -180,24 +201,35 @@ export default function DeliveryBundlesPage() {
 
         <div className="bg-white rounded-lg shadow p-4">
           <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-medium text-gray-500">Conflicts</h3>
-            <AlertTriangle className="h-5 w-5 text-red-500" />
+            <h3 className="text-sm font-medium text-gray-500">Inventory</h3>
+            <Package className="h-5 w-5 text-red-500" />
           </div>
           <div className="text-2xl font-bold text-red-600">
-            {stats?.conflicted_bundles ?? realtimeMetrics.conflicted}
+            {stats?.inventory_conflicts ?? realtimeMetrics.inventoryConflicts}
           </div>
-          <p className="text-xs text-gray-500 mt-1">Inventory blocked</p>
+          <p className="text-xs text-gray-500 mt-1">Stock conflicts</p>
         </div>
 
         <div className="bg-white rounded-lg shadow p-4">
           <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-medium text-gray-500">Max Bundle Size</h3>
-            <Package className="h-5 w-5 text-purple-500" />
+            <h3 className="text-sm font-medium text-gray-500">Time</h3>
+            <Clock className="h-5 w-5 text-amber-500" />
           </div>
-          <div className="text-2xl font-bold text-gray-900">
-            {stats?.max_bundle_size ?? realtimeMetrics.maxSize}
+          <div className="text-2xl font-bold text-amber-600">
+            {stats?.time_conflicts ?? realtimeMetrics.timeConflicts}
           </div>
-          <p className="text-xs text-gray-500 mt-1">Orders together</p>
+          <p className="text-xs text-gray-500 mt-1">Window conflicts</p>
+        </div>
+
+        <div className="bg-white rounded-lg shadow p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-medium text-gray-500">Resolved</h3>
+            <Wrench className="h-5 w-5 text-purple-500" />
+          </div>
+          <div className="text-2xl font-bold text-purple-600">
+            {stats?.resolved_conflicts ?? 0}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">Auto-fixable</p>
         </div>
 
         <div className="bg-white rounded-lg shadow p-4">
@@ -208,7 +240,7 @@ export default function DeliveryBundlesPage() {
           <div className="text-2xl font-bold text-emerald-600">
             {stats?.potential_savings_pct ?? 0}%
           </div>
-          <p className="text-xs text-gray-500 mt-1">Delivery cost reduction</p>
+          <p className="text-xs text-gray-500 mt-1">Cost reduction</p>
         </div>
       </div>
 
@@ -257,6 +289,13 @@ export default function DeliveryBundlesPage() {
             </label>
           </div>
 
+          {stats?.couriers_available !== undefined && stats.couriers_available > 0 && (
+            <div className="ml-auto flex items-center gap-2 text-sm text-gray-600">
+              <User className="h-4 w-4" />
+              {stats.couriers_available} couriers available
+            </div>
+          )}
+
           {isLoading && (
             <div className="ml-auto flex items-center gap-2 text-sm text-gray-500">
               <RefreshCw className="h-4 w-4 animate-spin" />
@@ -282,11 +321,15 @@ export default function DeliveryBundlesPage() {
                 <div className="flex items-center gap-4 text-sm">
                   <span className="flex items-center gap-1 text-green-600">
                     <CheckCircle2 className="h-4 w-4" />
-                    {bundles.filter(b => !b.has_conflict).length} valid
+                    {bundles.filter(b => !hasAnyConflict(b)).length} valid
                   </span>
                   <span className="flex items-center gap-1 text-red-600">
-                    <AlertTriangle className="h-4 w-4" />
-                    {bundles.filter(b => b.has_conflict).length} conflicts
+                    <Package className="h-4 w-4" />
+                    {bundles.filter(b => b.has_inventory_conflict).length} inventory
+                  </span>
+                  <span className="flex items-center gap-1 text-amber-600">
+                    <Clock className="h-4 w-4" />
+                    {bundles.filter(b => b.has_time_conflict).length} time
                   </span>
                 </div>
               </div>
@@ -306,13 +349,16 @@ export default function DeliveryBundlesPage() {
                       Order B
                     </th>
                     <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Bundle Size
+                      Size
                     </th>
                     <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Combined Value
+                      Value
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Conflict
+                      Courier
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Issue
                     </th>
                   </tr>
                 </thead>
@@ -320,18 +366,29 @@ export default function DeliveryBundlesPage() {
                   {bundles.map((bundle, idx) => (
                     <tr
                       key={`${bundle.order_a}-${bundle.order_b}-${idx}`}
-                      className={`hover:bg-gray-50 ${bundle.has_conflict ? 'bg-red-50/50' : ''}`}
+                      className={`hover:bg-gray-50 ${hasAnyConflict(bundle) ? 'bg-red-50/30' : ''}`}
                     >
                       <td className="px-4 py-3">
-                        {bundle.has_conflict ? (
+                        {bundle.has_inventory_conflict ? (
                           <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-red-700 bg-red-100 rounded-full">
-                            <AlertTriangle className="h-3 w-3" />
-                            Conflict
+                            <Package className="h-3 w-3" />
+                            Inventory
+                          </span>
+                        ) : bundle.has_time_conflict ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-700 bg-amber-100 rounded-full">
+                            <Clock className="h-3 w-3" />
+                            Time
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-green-700 bg-green-100 rounded-full">
                             <CheckCircle2 className="h-3 w-3" />
                             Valid
+                          </span>
+                        )}
+                        {bundle.resolution_type && (
+                          <span className="ml-1 inline-flex items-center px-1.5 py-0.5 text-xs font-medium text-purple-700 bg-purple-100 rounded">
+                            <Wrench className="h-2.5 w-2.5 mr-0.5" />
+                            {bundle.resolution_type === 'replenishment_incoming' ? 'Incoming' : 'Minor'}
                           </span>
                         )}
                       </td>
@@ -370,7 +427,23 @@ export default function DeliveryBundlesPage() {
                         ${formatAmount((bundle.order_a_total || 0) + (bundle.order_b_total || 0))}
                       </td>
                       <td className="px-4 py-3">
-                        {bundle.has_conflict && bundle.conflict_product_name ? (
+                        {bundle.courier_name || bundle.compatible_courier ? (
+                          <div className="text-sm">
+                            <div className="font-medium text-gray-700">
+                              {bundle.courier_name || bundle.compatible_courier}
+                            </div>
+                            {bundle.courier_vehicle_type && (
+                              <div className="text-xs text-gray-500 capitalize">
+                                {bundle.courier_vehicle_type}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-gray-400 text-xs">No courier</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        {bundle.has_inventory_conflict && bundle.conflict_product_name ? (
                           <div className="text-sm">
                             <div className="font-medium text-red-700">
                               {bundle.conflict_product_name}
@@ -379,8 +452,14 @@ export default function DeliveryBundlesPage() {
                               Need {bundle.total_needed}, have {bundle.available_stock}
                             </div>
                           </div>
-                        ) : bundle.has_conflict ? (
-                          <span className="text-gray-400 text-xs">Inventory conflict</span>
+                        ) : bundle.has_time_conflict && bundle.time_conflict_reason ? (
+                          <div className="text-sm">
+                            <div className="font-medium text-amber-700">
+                              {bundle.time_conflict_reason === 'no_window_overlap'
+                                ? 'No window overlap'
+                                : 'Bundle timing issue'}
+                            </div>
+                          </div>
                         ) : (
                           <span className="text-gray-400 text-xs">-</span>
                         )}
@@ -415,13 +494,15 @@ export default function DeliveryBundlesPage() {
           <div className="text-sm text-gray-600">
             <p className="font-medium text-gray-700 mb-1">About Delivery Bundling</p>
             <p>
-              This view uses Materialize's <code className="px-1 bg-white rounded text-xs">WITH MUTUALLY RECURSIVE</code> to
-              simultaneously compute bundle candidates and inventory conflicts. The algorithm considers:
+              This view uses Materialize's <code className="px-1 bg-white rounded text-xs">WITH MUTUALLY RECURSIVE</code> with
+              5 CTEs that reference each other. The algorithm considers:
             </p>
             <ul className="list-disc list-inside mt-2 space-y-1 text-gray-500">
-              <li>Orders from the same store with overlapping delivery windows</li>
-              <li>Inventory availability across all products in bundled orders</li>
-              <li>Transitive conflicts that propagate through bundle chains</li>
+              <li><strong>Inventory conflicts</strong>: Orders competing for scarce stock</li>
+              <li><strong>Time conflicts</strong>: Delivery windows that don't overlap</li>
+              <li><strong>Courier compatibility</strong>: Available drivers with suitable vehicles</li>
+              <li><strong>Resolved conflicts</strong>: Issues fixed by incoming replenishment</li>
+              <li><strong>Transitive propagation</strong>: Conflicts that ripple through bundle chains</li>
             </ul>
           </div>
         </div>

@@ -772,12 +772,12 @@ class FreshMartService:
     ) -> list[DeliveryBundle]:
         """List delivery bundles from delivery_bundles_mv.
 
-        This view demonstrates Materialize's WITH MUTUALLY RECURSIVE feature,
-        computing bundleable orders while detecting inventory conflicts.
+        This view demonstrates Materialize's WITH MUTUALLY RECURSIVE feature
+        with 5 mutually recursive CTEs that reference each other.
 
         Args:
             store_id: Optional filter by store
-            has_conflict: Optional filter by conflict status
+            has_conflict: Optional filter by conflict status (inventory or time)
             min_bundle_size: Minimum bundle size (default 2)
             limit: Maximum number of results
             offset: Offset for pagination
@@ -793,16 +793,21 @@ class FreshMartService:
             params["store_id"] = store_id
 
         if has_conflict is not None:
-            conditions.append("has_conflict = :has_conflict")
-            params["has_conflict"] = has_conflict
+            if has_conflict:
+                conditions.append("(has_inventory_conflict = TRUE OR has_time_conflict = TRUE)")
+            else:
+                conditions.append("has_inventory_conflict = FALSE AND has_time_conflict = FALSE")
 
         conditions.append("bundle_size >= :min_bundle_size")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         query = f"""
-            SELECT order_a, order_b, store_id, bundle_size, has_conflict,
-                   conflict_product, available_stock, total_needed
+            SELECT order_a, order_b, store_id, bundle_size,
+                   has_inventory_conflict, has_time_conflict,
+                   conflict_product, available_stock, total_needed,
+                   resolution_type, compatible_courier, courier_vehicle_type,
+                   time_conflict_reason
             FROM delivery_bundles_mv
             {where_clause}
             ORDER BY bundle_size DESC, store_id, order_a
@@ -818,10 +823,15 @@ class FreshMartService:
                 order_b=row.order_b,
                 store_id=row.store_id,
                 bundle_size=row.bundle_size,
-                has_conflict=row.has_conflict or False,
+                has_inventory_conflict=row.has_inventory_conflict or False,
+                has_time_conflict=row.has_time_conflict or False,
                 conflict_product=row.conflict_product,
                 available_stock=row.available_stock,
                 total_needed=row.total_needed,
+                resolution_type=row.resolution_type,
+                compatible_courier=row.compatible_courier,
+                courier_vehicle_type=row.courier_vehicle_type,
+                time_conflict_reason=row.time_conflict_reason,
             )
             for row in rows
         ]
@@ -836,7 +846,7 @@ class FreshMartService:
     ) -> list[DeliveryBundleEnriched]:
         """List delivery bundles with enriched order and store details.
 
-        Joins the delivery bundles view with order and store information
+        Joins the delivery bundles view with order, store, and courier information
         to provide a complete picture for the UI.
 
         Args:
@@ -857,8 +867,10 @@ class FreshMartService:
             params["store_id"] = store_id
 
         if has_conflict is not None:
-            conditions.append("db.has_conflict = :has_conflict")
-            params["has_conflict"] = has_conflict
+            if has_conflict:
+                conditions.append("(db.has_inventory_conflict = TRUE OR db.has_time_conflict = TRUE)")
+            else:
+                conditions.append("db.has_inventory_conflict = FALSE AND db.has_time_conflict = FALSE")
 
         conditions.append("db.bundle_size >= :min_bundle_size")
 
@@ -870,10 +882,15 @@ class FreshMartService:
                 db.order_b,
                 db.store_id,
                 db.bundle_size,
-                db.has_conflict,
+                db.has_inventory_conflict,
+                db.has_time_conflict,
                 db.conflict_product,
                 db.available_stock,
                 db.total_needed,
+                db.resolution_type,
+                db.compatible_courier,
+                db.courier_vehicle_type,
+                db.time_conflict_reason,
                 oa.order_number AS order_a_number,
                 ob.order_number AS order_b_number,
                 ca.customer_name AS order_a_customer,
@@ -882,7 +899,8 @@ class FreshMartService:
                 ob.order_total_amount AS order_b_total,
                 s.store_name,
                 s.store_zone,
-                p.product_name AS conflict_product_name
+                p.product_name AS conflict_product_name,
+                cr.courier_name
             FROM delivery_bundles_mv db
             LEFT JOIN orders_flat_mv oa ON oa.order_id = db.order_a
             LEFT JOIN orders_flat_mv ob ON ob.order_id = db.order_b
@@ -890,6 +908,7 @@ class FreshMartService:
             LEFT JOIN customers_flat cb ON cb.customer_id = ob.customer_id
             LEFT JOIN stores_flat s ON s.store_id = db.store_id
             LEFT JOIN products_flat p ON p.product_id = db.conflict_product
+            LEFT JOIN couriers_flat cr ON cr.courier_id = db.compatible_courier
             {where_clause}
             ORDER BY db.bundle_size DESC, db.store_id, db.order_a
             LIMIT :limit OFFSET :offset
@@ -904,10 +923,15 @@ class FreshMartService:
                 order_b=row.order_b,
                 store_id=row.store_id,
                 bundle_size=row.bundle_size,
-                has_conflict=row.has_conflict or False,
+                has_inventory_conflict=row.has_inventory_conflict or False,
+                has_time_conflict=row.has_time_conflict or False,
                 conflict_product=row.conflict_product,
                 available_stock=row.available_stock,
                 total_needed=row.total_needed,
+                resolution_type=row.resolution_type,
+                compatible_courier=row.compatible_courier,
+                courier_vehicle_type=row.courier_vehicle_type,
+                time_conflict_reason=row.time_conflict_reason,
                 order_a_number=row.order_a_number,
                 order_b_number=row.order_b_number,
                 order_a_customer=row.order_a_customer,
@@ -917,6 +941,7 @@ class FreshMartService:
                 store_name=row.store_name,
                 store_zone=row.store_zone,
                 conflict_product_name=row.conflict_product_name,
+                courier_name=row.courier_name,
             )
             for row in rows
         ]
@@ -945,10 +970,13 @@ class FreshMartService:
         query = f"""
             SELECT
                 COUNT(*) AS total_bundles,
-                COUNT(*) FILTER (WHERE has_conflict = FALSE) AS valid_bundles,
-                COUNT(*) FILTER (WHERE has_conflict = TRUE) AS conflicted_bundles,
+                COUNT(*) FILTER (WHERE has_inventory_conflict = FALSE AND has_time_conflict = FALSE) AS valid_bundles,
+                COUNT(*) FILTER (WHERE has_inventory_conflict = TRUE) AS inventory_conflicts,
+                COUNT(*) FILTER (WHERE has_time_conflict = TRUE) AS time_conflicts,
+                COUNT(*) FILTER (WHERE resolution_type IS NOT NULL) AS resolved_conflicts,
                 COALESCE(MAX(bundle_size), 0) AS max_bundle_size,
-                COUNT(DISTINCT store_id) AS stores_with_bundles
+                COUNT(DISTINCT store_id) AS stores_with_bundles,
+                COUNT(DISTINCT compatible_courier) AS couriers_available
             FROM delivery_bundles_mv
             {where_clause}
         """
@@ -968,8 +996,11 @@ class FreshMartService:
         return DeliveryBundleStats(
             total_bundles=total,
             valid_bundles=valid,
-            conflicted_bundles=row.conflicted_bundles or 0,
+            inventory_conflicts=row.inventory_conflicts or 0,
+            time_conflicts=row.time_conflicts or 0,
+            resolved_conflicts=row.resolved_conflicts or 0,
             max_bundle_size=row.max_bundle_size or 0,
             stores_with_bundles=row.stores_with_bundles or 0,
+            couriers_available=row.couriers_available or 0,
             potential_savings_pct=round(potential_savings, 1),
         )

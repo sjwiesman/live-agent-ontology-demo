@@ -269,16 +269,28 @@ class DeliveryBundle(BaseModel):
 
     Represents a potential bundle of orders that can be delivered together,
     computed using Materialize's mutual recursion (WITH MUTUALLY RECURSIVE).
+
+    This view uses 5 mutually recursive CTEs:
+    - inventory_conflicts: Detects stock shortages
+    - time_conflicts: Detects delivery window incompatibilities
+    - courier_compatible: Finds available couriers
+    - resolved_conflicts: Tracks resolvable conflicts
+    - bundle_candidates: The bundleable order pairs
     """
 
     order_a: str
     order_b: str
     store_id: Optional[str] = None
     bundle_size: int = 2
-    has_conflict: bool = False
+    has_inventory_conflict: bool = False
+    has_time_conflict: bool = False
     conflict_product: Optional[str] = None
     available_stock: Optional[int] = None
     total_needed: Optional[int] = None
+    resolution_type: Optional[str] = None
+    compatible_courier: Optional[str] = None
+    courier_vehicle_type: Optional[str] = None
+    time_conflict_reason: Optional[str] = None
 
 
 class DeliveryBundleEnriched(DeliveryBundle):
@@ -293,6 +305,7 @@ class DeliveryBundleEnriched(DeliveryBundle):
     store_name: Optional[str] = None
     store_zone: Optional[str] = None
     conflict_product_name: Optional[str] = None
+    courier_name: Optional[str] = None
 
 
 class DeliveryBundleStats(BaseModel):
@@ -300,7 +313,10 @@ class DeliveryBundleStats(BaseModel):
 
     total_bundles: int = 0
     valid_bundles: int = 0
-    conflicted_bundles: int = 0
+    inventory_conflicts: int = 0
+    time_conflicts: int = 0
+    resolved_conflicts: int = 0
     max_bundle_size: int = 0
     stores_with_bundles: int = 0
+    couriers_available: int = 0
     potential_savings_pct: Optional[float] = None

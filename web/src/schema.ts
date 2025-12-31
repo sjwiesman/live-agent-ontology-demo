@@ -233,17 +233,23 @@ const store_capacity_health_mv = table('store_capacity_health_mv')
   .primaryKey('store_id')
 
 // delivery_bundles_mv - delivery bundling with mutual recursion
-// Demonstrates Materialize's WITH MUTUALLY RECURSIVE capability
+// Demonstrates Materialize's WITH MUTUALLY RECURSIVE capability using 5 CTEs:
+// inventory_conflicts, time_conflicts, courier_compatible, resolved_conflicts, bundle_candidates
 const delivery_bundles_mv = table('delivery_bundles_mv')
   .columns({
     order_a: string(),
     order_b: string(),
     store_id: string().optional(),
     bundle_size: number().optional(),
-    has_conflict: boolean().optional(),
+    has_inventory_conflict: boolean().optional(),
+    has_time_conflict: boolean().optional(),
     conflict_product: string().optional(),
     available_stock: number().optional(),
     total_needed: number().optional(),
+    resolution_type: string().optional(),
+    compatible_courier: string().optional(),
+    courier_vehicle_type: string().optional(),
+    time_conflict_reason: string().optional(),
   })
   .primaryKey(['order_a', 'order_b'])
 

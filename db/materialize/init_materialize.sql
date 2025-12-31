@@ -305,9 +305,24 @@ CREATE INDEX IF NOT EXISTS customers_idx IN CLUSTER serving ON customers_mv (cus
 -- KEY INSIGHT: Standard SQL WITH RECURSIVE only allows self-reference.
 -- Materialize allows multiple CTEs to reference EACH OTHER simultaneously.
 --
--- This algorithm finds orders that can be bundled for delivery while detecting
--- inventory conflicts that would prevent bundling - and these two computations
--- depend on each other in a way that requires mutual recursion.
+-- This algorithm uses FIVE mutually recursive CTEs:
+--   1. inventory_conflicts   - Detects stock shortages between orders
+--   2. time_conflicts        - Detects delivery window incompatibilities
+--   3. courier_compatible    - Finds available couriers for bundles
+--   4. resolved_conflicts    - Tracks conflicts that can be worked around
+--   5. bundle_candidates     - The actual bundleable order pairs
+--
+-- The chicken-and-egg relationships:
+--   - inventory_conflicts depends on bundle_candidates (transitive propagation)
+--   - bundle_candidates depends on inventory_conflicts (exclusion)
+--   - bundle_candidates depends on time_conflicts (exclusion)
+--   - bundle_candidates depends on courier_compatible (requirement)
+--   - time_conflicts depends on bundle_candidates (timing validation)
+--   - resolved_conflicts depends on inventory_conflicts (conflict input)
+--   - inventory_conflicts excludes resolved_conflicts (resolution)
+--
+-- This is IMPOSSIBLE in standard SQL - you'd need multiple queries,
+-- stored procedures, or application logic!
 -- =============================================================================
 
 -- Order lines flat view needed for delivery bundling
@@ -330,10 +345,10 @@ WITH MUTUALLY RECURSIVE
     -- =========================================================================
     -- CTE 1: INVENTORY CONFLICTS
     -- Orders that compete for the same scarce inventory
-    -- REFERENCES: bundle_candidates (for transitive conflict propagation)
+    -- REFERENCES: bundle_candidates, resolved_conflicts
     -- =========================================================================
     inventory_conflicts(order_a TEXT, order_b TEXT, product_id TEXT, available_stock INT, total_needed INT) AS (
-        -- Base case: direct conflicts
+        -- Base case: direct inventory conflicts
         -- Two orders want the same product but store doesn't have enough for both
         SELECT
             ol1.order_id AS order_a,
@@ -344,23 +359,27 @@ WITH MUTUALLY RECURSIVE
         FROM order_lines_flat ol1
         JOIN order_lines_flat ol2
             ON ol1.product_id = ol2.product_id
-            AND ol1.order_id < ol2.order_id  -- Avoid duplicates
+            AND ol1.order_id < ol2.order_id
         JOIN orders_flat_mv o1 ON o1.order_id = ol1.order_id
         JOIN orders_flat_mv o2 ON o2.order_id = ol2.order_id
         JOIN store_inventory_mv inv
             ON inv.product_id = ol1.product_id
             AND inv.store_id = o1.store_id
-        WHERE o1.store_id = o2.store_id           -- Same store
-            AND o1.order_status = 'CREATED'        -- Only active orders
+        WHERE o1.store_id = o2.store_id
+            AND o1.order_status = 'CREATED'
             AND o2.order_status = 'CREATED'
-            AND inv.stock_level < (ol1.quantity + ol2.quantity)  -- NOT ENOUGH!
+            AND inv.stock_level < (ol1.quantity + ol2.quantity)
+            -- Exclude conflicts that have been resolved
+            AND NOT EXISTS (
+                SELECT 1 FROM resolved_conflicts rc
+                WHERE rc.order_a = ol1.order_id AND rc.order_b = ol2.order_id
+            )
 
         UNION
 
         -- Transitive conflicts: if A conflicts with B, and B is bundled with C,
-        -- then the conflict propagates to affect A-C relationship too!
-        --
-        -- THIS IS THE MUTUAL REFERENCE: conflicts depend on bundles
+        -- then the conflict propagates to affect A-C relationship
+        -- THIS IS MUTUAL: conflicts depend on bundles
         SELECT DISTINCT
             ic.order_a,
             bc.order_b,
@@ -374,9 +393,92 @@ WITH MUTUALLY RECURSIVE
     ),
 
     -- =========================================================================
-    -- CTE 2: BUNDLE CANDIDATES
+    -- CTE 2: TIME CONFLICTS
+    -- Orders with incompatible delivery windows or timing issues
+    -- REFERENCES: bundle_candidates (for extended window validation)
+    -- =========================================================================
+    time_conflicts(order_a TEXT, order_b TEXT, conflict_reason TEXT) AS (
+        -- Base case: delivery windows don't overlap at all
+        SELECT
+            o1.order_id AS order_a,
+            o2.order_id AS order_b,
+            'no_window_overlap' AS conflict_reason
+        FROM orders_flat_mv o1
+        JOIN orders_flat_mv o2
+            ON o1.store_id = o2.store_id
+            AND o1.order_id < o2.order_id
+            AND o1.order_status = 'CREATED'
+            AND o2.order_status = 'CREATED'
+        WHERE o1.delivery_window_end::timestamptz < o2.delivery_window_start::timestamptz
+           OR o2.delivery_window_end::timestamptz < o1.delivery_window_start::timestamptz
+
+        UNION
+
+        -- Extended bundles may create timing conflicts
+        -- If bundle A-B exists and we want to add C, check if A-C timing works
+        SELECT DISTINCT
+            bc.order_a,
+            o.order_id AS order_b,
+            'bundle_timing_conflict' AS conflict_reason
+        FROM bundle_candidates bc
+        JOIN orders_flat_mv oa ON oa.order_id = bc.order_a
+        JOIN orders_flat_mv o ON o.store_id = bc.store_id
+            AND o.order_id > bc.order_b
+            AND o.order_status = 'CREATED'
+        WHERE oa.delivery_window_end::timestamptz < o.delivery_window_start::timestamptz
+           OR o.delivery_window_end::timestamptz < oa.delivery_window_start::timestamptz
+    ),
+
+    -- =========================================================================
+    -- CTE 3: COURIER COMPATIBLE
+    -- Available couriers who can handle the bundled delivery
+    -- REFERENCES: bundle_candidates (to know what bundles need couriers)
+    -- =========================================================================
+    courier_compatible(order_a TEXT, order_b TEXT, courier_id TEXT, vehicle_type TEXT) AS (
+        -- Find couriers available at the store for each potential bundle
+        SELECT DISTINCT
+            bc.order_a,
+            bc.order_b,
+            c.courier_id,
+            c.vehicle_type
+        FROM bundle_candidates bc
+        JOIN couriers_flat c ON c.home_store_id = bc.store_id
+        WHERE c.courier_status = 'AVAILABLE'
+            -- Ensure at least one courier can handle bundles
+            AND c.vehicle_type IN ('car', 'van')  -- Bikes can't do bundles
+    ),
+
+    -- =========================================================================
+    -- CTE 4: RESOLVED CONFLICTS
+    -- Inventory conflicts that can be worked around
+    -- REFERENCES: inventory_conflicts (to know what conflicts exist)
+    -- =========================================================================
+    resolved_conflicts(order_a TEXT, order_b TEXT, resolution_type TEXT) AS (
+        -- Conflicts can be resolved if there's incoming replenishment
+        SELECT
+            ic.order_a,
+            ic.order_b,
+            'replenishment_incoming' AS resolution_type
+        FROM inventory_conflicts ic
+        JOIN store_inventory_mv inv ON inv.product_id = ic.product_id
+        WHERE inv.replenishment_eta IS NOT NULL
+            AND inv.replenishment_eta::timestamptz <= NOW() + INTERVAL '2 hours'
+
+        UNION
+
+        -- Conflicts can be resolved if the shortage is minor (need just 1 more)
+        SELECT
+            ic.order_a,
+            ic.order_b,
+            'minor_shortage' AS resolution_type
+        FROM inventory_conflicts ic
+        WHERE ic.total_needed - ic.available_stock <= 1
+    ),
+
+    -- =========================================================================
+    -- CTE 5: BUNDLE CANDIDATES
     -- Orders that can potentially be delivered together
-    -- REFERENCES: inventory_conflicts (to exclude conflicting pairs)
+    -- REFERENCES: inventory_conflicts, time_conflicts, courier_compatible
     -- =========================================================================
     bundle_candidates(order_a TEXT, order_b TEXT, store_id TEXT, bundle_size INT) AS (
         -- Base case: pairs of orders that could be bundled
@@ -391,18 +493,28 @@ WITH MUTUALLY RECURSIVE
             AND o1.order_id < o2.order_id
             AND o1.order_status = 'CREATED'
             AND o2.order_status = 'CREATED'
-        -- Time windows must overlap (can deliver together)
+        -- Time windows must overlap
         WHERE o1.delivery_window_start::timestamptz <= o2.delivery_window_end::timestamptz
             AND o1.delivery_window_end::timestamptz >= o2.delivery_window_start::timestamptz
-        -- THIS IS THE MUTUAL REFERENCE: bundles exclude conflicts
-        AND NOT EXISTS (
-            SELECT 1 FROM inventory_conflicts ic
-            WHERE ic.order_a = o1.order_id AND ic.order_b = o2.order_id
-        )
+            -- No unresolved inventory conflicts
+            AND NOT EXISTS (
+                SELECT 1 FROM inventory_conflicts ic
+                WHERE ic.order_a = o1.order_id AND ic.order_b = o2.order_id
+            )
+            -- No time conflicts
+            AND NOT EXISTS (
+                SELECT 1 FROM time_conflicts tc
+                WHERE tc.order_a = o1.order_id AND tc.order_b = o2.order_id
+            )
+            -- At least one compatible courier exists
+            AND EXISTS (
+                SELECT 1 FROM courier_compatible cc
+                WHERE cc.order_a = o1.order_id AND cc.order_b = o2.order_id
+            )
 
         UNION
 
-        -- Extend bundles: grow the bundle by adding more orders
+        -- Recursive: extend bundles by adding more orders
         SELECT DISTINCT
             bc.order_a,
             o.order_id AS order_b,
@@ -413,27 +525,48 @@ WITH MUTUALLY RECURSIVE
             ON o.store_id = bc.store_id
             AND o.order_id > bc.order_b
             AND o.order_status = 'CREATED'
-        WHERE bc.bundle_size < 5  -- Max 5 orders per bundle
-            -- No conflicts with any existing order in the bundle
+        WHERE bc.bundle_size < 5
+            -- No inventory conflicts with new order
             AND NOT EXISTS (
                 SELECT 1 FROM inventory_conflicts ic
                 WHERE (ic.order_a = bc.order_a AND ic.order_b = o.order_id)
                    OR (ic.order_a = bc.order_b AND ic.order_b = o.order_id)
             )
+            -- No time conflicts with new order
+            AND NOT EXISTS (
+                SELECT 1 FROM time_conflicts tc
+                WHERE (tc.order_a = bc.order_a AND tc.order_b = o.order_id)
+                   OR (tc.order_a = bc.order_b AND tc.order_b = o.order_id)
+            )
     )
--- Final output: all bundles with their conflict status
+-- Final output: bundles with all conflict and compatibility info
 SELECT
     bc.order_a,
     bc.order_b,
     bc.store_id,
     bc.bundle_size,
-    CASE WHEN ic.order_a IS NOT NULL THEN TRUE ELSE FALSE END AS has_conflict,
+    COALESCE(ic.order_a IS NOT NULL, FALSE) AS has_inventory_conflict,
+    COALESCE(tc.order_a IS NOT NULL, FALSE) AS has_time_conflict,
     ic.product_id AS conflict_product,
     ic.available_stock,
-    ic.total_needed
+    ic.total_needed,
+    rc.resolution_type,
+    cc.courier_id AS compatible_courier,
+    cc.vehicle_type AS courier_vehicle_type,
+    tc.conflict_reason AS time_conflict_reason
 FROM bundle_candidates bc
 LEFT JOIN inventory_conflicts ic
-    ON ic.order_a = bc.order_a AND ic.order_b = bc.order_b;
+    ON ic.order_a = bc.order_a AND ic.order_b = bc.order_b
+LEFT JOIN time_conflicts tc
+    ON tc.order_a = bc.order_a AND tc.order_b = bc.order_b
+LEFT JOIN resolved_conflicts rc
+    ON rc.order_a = bc.order_a AND rc.order_b = bc.order_b
+LEFT JOIN LATERAL (
+    SELECT courier_id, vehicle_type
+    FROM courier_compatible
+    WHERE order_a = bc.order_a AND order_b = bc.order_b
+    LIMIT 1
+) cc ON TRUE;
 
 -- Indexes for delivery bundles
 CREATE INDEX IF NOT EXISTS delivery_bundles_store_idx

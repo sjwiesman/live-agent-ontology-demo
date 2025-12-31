@@ -388,15 +388,21 @@ export interface TripleWriteRequest {
 }
 
 // Delivery Bundles Types (Mutual Recursion Demo)
+// Uses 5 mutually recursive CTEs in Materialize
 export interface DeliveryBundle {
   order_a: string
   order_b: string
   store_id: string | null
   bundle_size: number
-  has_conflict: boolean
+  has_inventory_conflict: boolean
+  has_time_conflict: boolean
   conflict_product: string | null
   available_stock: number | null
   total_needed: number | null
+  resolution_type: string | null
+  compatible_courier: string | null
+  courier_vehicle_type: string | null
+  time_conflict_reason: string | null
 }
 
 export interface DeliveryBundleEnriched extends DeliveryBundle {
@@ -409,14 +415,18 @@ export interface DeliveryBundleEnriched extends DeliveryBundle {
   store_name: string | null
   store_zone: string | null
   conflict_product_name: string | null
+  courier_name: string | null
 }
 
 export interface DeliveryBundleStats {
   total_bundles: number
   valid_bundles: number
-  conflicted_bundles: number
+  inventory_conflicts: number
+  time_conflicts: number
+  resolved_conflicts: number
   max_bundle_size: number
   stores_with_bundles: number
+  couriers_available: number
   potential_savings_pct: number | null
 }
 

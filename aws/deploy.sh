@@ -88,7 +88,8 @@ KEY_NAME="live-context-graph-${IAM_USER}"
 KEY_FILE="${STATE_DIR}/${KEY_NAME}.pem"
 EXISTING_KEY_NAME=$(load_state "key-pair-name")
 
-if [[ -n "$EXISTING_KEY_NAME" && -f "$(load_state 'key-file')" ]]; then
+if [[ -n "$EXISTING_KEY_NAME" && -f "$(load_state 'key-file')" ]] && \
+   aws ec2 describe-key-pairs --key-names "$EXISTING_KEY_NAME" &>/dev/null; then
   KEY_NAME="$EXISTING_KEY_NAME"
   KEY_FILE=$(load_state "key-file")
   log "Using existing key pair: $KEY_NAME"

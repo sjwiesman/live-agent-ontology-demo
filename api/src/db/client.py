@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config import get_settings
@@ -223,6 +223,7 @@ async def get_mz_session() -> AsyncGenerator[AsyncSession, None]:
     """Get Materialize session context manager."""
     factory = get_mz_session_factory()
     async with factory() as session:
+        await session.execute(text("SET transaction_isolation = 'serializable'"))
         yield session
 
 

@@ -96,10 +96,15 @@ CREATE SOURCE IF NOT EXISTS pg_source
     IN CLUSTER ingest
     FROM POSTGRES CONNECTION pg_connection (PUBLICATION 'mz_source');"
 
-# Create table from source (new v26 syntax, replaces FOR ALL TABLES)
+# Create table from source (new v26 syntax, replaces FOR ALL TABLES).
+# RETAIN HISTORY 5min is required so SUBSCRIBEs from materialize-zero don't
+# fail with `Timestamp not valid for all inputs`. ALTER TABLE doesn't work
+# on source-derived tables (mz bug — planner accepts but catalog rejects),
+# so retention must be set at CREATE time.
 psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
 CREATE TABLE IF NOT EXISTS triples
-    FROM SOURCE pg_source (REFERENCE public.triples);"
+    FROM SOURCE pg_source (REFERENCE public.triples)
+    WITH (RETAIN HISTORY FOR '5 minutes');"
 
 echo "Waiting for source to hydrate..."
 sleep 5
@@ -1567,6 +1572,52 @@ else
     psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS delivery_bundles_id_idx IN CLUSTER serving ON delivery_bundles_mv (bundle_id);"
     psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS compatible_pairs_pk_idx IN CLUSTER serving ON compatible_pairs_mv (order_a, order_b);"
 fi
+
+echo "Setting RETAIN HISTORY for materialize-zero compatibility..."
+# Without this, materialized views default to RETAIN HISTORY = 1s. When
+# zero-cache reconnects to the materialize-zero sidecar with a stored
+# lastWatermark older than 1s (which happens routinely during the burst of
+# ~14 simultaneous subscribes at boot, or after any zero-cache restart), mz
+# rejects the AS OF and the sidecar's error path sends `reset-required` to
+# zero-cache, which exits 14 (auto-reset). The cycle repeats indefinitely.
+#
+# The fix has to apply to the WHOLE dependency chain — Materialize's
+# `Timestamp (X) is not valid for all inputs` error is raised when the chosen
+# AS OF is below the `since` of *any* upstream collection, not just the leaf
+# MV. Setting retention only on the leaf MVs leaves pg_source at the default
+# 1s window and the loop continues. We set it on the postgres source AND the
+# 14 leaf MVs the sidecar subscribes to.
+#
+# Five minutes is comfortably longer than any reasonable resubscribe round-trip.
+# enable_logical_compaction_window must be on (set in the mz command in
+# docker-compose.yml).
+psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize <<'SQL'
+ALTER SOURCE pg_source SET (RETAIN HISTORY FOR '5 minutes');
+-- Intermediate MVs: these aren't subscribed by materialize-zero directly,
+-- but the leaf MVs depend on them, so their `since` constrains the
+-- timestamp validity check (`Timestamp not valid for all inputs`).
+ALTER MATERIALIZED VIEW order_lines_flat_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_courier_metrics_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_metrics_by_window_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_metrics_timeseries_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_wait_time_by_window_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW system_metrics_timeseries_mv SET (RETAIN HISTORY FOR '5 minutes');
+-- Leaf MVs that materialize-zero subscribes to:
+ALTER MATERIALIZED VIEW orders_flat_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW courier_schedule_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW customers_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW orders_search_source_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW products_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_inventory_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW stores_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW orders_with_lines_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW inventory_items_with_dynamic_pricing_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW pricing_yield_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW inventory_risk_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW store_capacity_health_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW delivery_bundles_mv SET (RETAIN HISTORY FOR '5 minutes');
+ALTER MATERIALIZED VIEW compatible_pairs_mv SET (RETAIN HISTORY FOR '5 minutes');
+SQL
 
 echo "Verifying three-tier setup..."
 echo ""

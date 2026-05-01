@@ -38,7 +38,7 @@ router = APIRouter(prefix="/api/query-stats", tags=["Query Statistics"])
 # Configuration
 MAX_SAMPLES = 500000  # Keep 3 min of history even at high QPS (~2700 QPS * 180s). Memory: ~12MB per source.
 BATCH_REFRESH_INTERVAL = 60  # seconds
-HEARTBEAT_INTERVAL = 0.5  # 500ms
+HEARTBEAT_INTERVAL = 0.1  # 100ms
 QPS_WINDOW_SIZE = 1.0  # 1 second rolling window for QPS calculation
 
 # Concurrency limits per source (Freshmart approach)
@@ -218,7 +218,7 @@ def serialize_row(row: dict) -> dict:
 
 
 async def heartbeat_loop():
-    """Update the selected order's product inventory timestamp every 500ms.
+    """Update the selected order's product inventory timestamp every 100ms.
 
     This continuously updates the `updated_at` on an inventory item's stock_level triple
     for a product that IS IN the currently selected order. This allows us to measure

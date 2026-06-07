@@ -267,6 +267,9 @@ services:
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
       CONNECT_REST_PORT: 8083
       CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components,/usr/local/share/kafka/plugins
+      # Jolokia agent: expose the embedding SMT's JMX MBean over HTTP (:8778,
+      # compose-internal). The backend reads it at GET /api/search/embedding-metrics.
+      KAFKA_OPTS: "-javaagent:/usr/local/share/kafka/jolokia-agent.jar=port=8778,host=0.0.0.0"
     ports:
       - "${CONNECT_PORT:-8083}:8083"
     healthcheck:

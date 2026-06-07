@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # Query-time embedding calls this so it matches the ingest-time SMT.
     embedding_service_url: str = "http://embedding-service:8085"
 
+    # Jolokia agent on kafka-connect. Exposes the embedding SMT's JMX MBean
+    # over HTTP/JSON; read by GET /api/search/embedding-metrics.
+    jolokia_url: str = "http://kafka-connect:8778"
+
     # Application
     log_level: str = "INFO"
     api_port: int = 8080

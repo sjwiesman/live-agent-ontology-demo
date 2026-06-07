@@ -650,3 +650,74 @@ class TestIndexImpactAPI:
             )
         assert response.status_code == 200
         assert response.json()["pct"] == 0.0
+
+
+class TestEmbeddingMetricsAPI:
+    """Tests for /api/search/embedding-metrics (Jolokia -> SMT MBean)."""
+
+    @pytest.mark.asyncio
+    async def test_embedding_metrics_available(self, async_client: AsyncClient):
+        """Returns mapped counters with available=True on a 200 Jolokia read."""
+        jolokia_payload = {
+            "status": 200,
+            "value": {
+                "EmbeddingsComputed": 120,
+                "EmbeddingsSkipped": 380,
+                "EmbeddingsPossible": 500,
+                "SkipRatio": 0.76,
+            },
+        }
+        with patch("httpx.AsyncClient.post") as mock_post:
+            mock_post.return_value = AsyncMock(status_code=200, json=lambda: jolokia_payload)
+            mock_post.return_value.raise_for_status = lambda: None
+
+            response = await async_client.get("/api/search/embedding-metrics")
+            assert response.status_code == 200
+            data = response.json()
+            assert data == {
+                "computed": 120,
+                "skipped": 380,
+                "possible": 500,
+                "skip_ratio": 0.76,
+                "available": True,
+            }
+
+    @pytest.mark.asyncio
+    async def test_embedding_metrics_unavailable(self, async_client: AsyncClient):
+        """Returns available=False with zeros when Jolokia is unreachable."""
+        import httpx as _httpx
+        with patch("httpx.AsyncClient.post", side_effect=_httpx.ConnectError("boom")):
+            response = await async_client.get("/api/search/embedding-metrics")
+            assert response.status_code == 200
+            data = response.json()
+            assert data == {
+                "computed": 0,
+                "skipped": 0,
+                "possible": 0,
+                "skip_ratio": 0.0,
+                "available": False,
+            }
+
+    @pytest.mark.asyncio
+    async def test_embedding_metrics_non_200_jolokia_status(self, async_client: AsyncClient):
+        """Returns available=False when Jolokia reports a non-200 status (e.g. MBean missing)."""
+        jolokia_payload = {"status": 404, "error": "InstanceNotFoundException"}
+        with patch("httpx.AsyncClient.post") as mock_post:
+            mock_post.return_value = AsyncMock(status_code=200, json=lambda: jolokia_payload)
+            mock_post.return_value.raise_for_status = lambda: None
+
+            response = await async_client.get("/api/search/embedding-metrics")
+            assert response.status_code == 200
+            assert response.json()["available"] is False
+
+    @pytest.mark.asyncio
+    async def test_embedding_metrics_malformed_value(self, async_client: AsyncClient):
+        """A 200 with a non-dict `value` degrades gracefully instead of erroring."""
+        jolokia_payload = {"status": 200, "value": "not-a-dict"}
+        with patch("httpx.AsyncClient.post") as mock_post:
+            mock_post.return_value = AsyncMock(status_code=200, json=lambda: jolokia_payload)
+            mock_post.return_value.raise_for_status = lambda: None
+
+            response = await async_client.get("/api/search/embedding-metrics")
+            assert response.status_code == 200
+            assert response.json()["available"] is False

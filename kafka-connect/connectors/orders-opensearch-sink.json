@@ -23,6 +23,7 @@
   "transforms.embed.openai.endpoint": "http://embedding-service:8085/v1/embeddings",
   "transforms.embed.openai.api.key": "local-facade-no-key-needed",
   "transforms.embed.openai.model": "bge-small",
+  "transforms.embed.metrics.id": "orders",
   "transforms.tsHeader.type": "io.debezium.transforms.HeaderToValue",
   "transforms.tsHeader.headers": "materialize-timestamp",
   "transforms.tsHeader.fields": "mz_timestamp",

@@ -14,6 +14,7 @@ USER root
 ARG SMT_VERSION=0.1.0
 ARG AIVEN_OS_VERSION=3.1.0
 ARG DEBEZIUM_VERSION=2.7.0.Final
+ARG JOLOKIA_VERSION=2.2.9
 
 ENV PLUGINS_DIR=/usr/local/share/kafka/plugins
 
@@ -39,5 +40,10 @@ RUN mkdir -p ${PLUGINS_DIR}/debezium-transforms \
       "https://repo1.maven.org/maven2/io/debezium/debezium-core/${DEBEZIUM_VERSION}/debezium-core-${DEBEZIUM_VERSION}.jar" \
     && curl -fsSL -o ${PLUGINS_DIR}/debezium-transforms/debezium-api.jar \
       "https://repo1.maven.org/maven2/io/debezium/debezium-api/${DEBEZIUM_VERSION}/debezium-api-${DEBEZIUM_VERSION}.jar"
+
+# 4. Jolokia JVM agent — exposes the SMT's JMX MBean over HTTP/JSON so the
+#    backend can read embedding-diff counters without a JMX/RMI client.
+RUN curl -fsSL -o /usr/local/share/kafka/jolokia-agent.jar \
+      "https://repo1.maven.org/maven2/org/jolokia/jolokia-agent-jvm/${JOLOKIA_VERSION}/jolokia-agent-jvm-${JOLOKIA_VERSION}-javaagent.jar"
 
 USER appuser

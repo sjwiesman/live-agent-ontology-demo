@@ -39,6 +39,7 @@ import {
   OrderLineItem,
   ViewDefinitionResponse,
 } from "../api/client";
+import { singleFlight } from "../api/singleFlight";
 import { LineageGraph } from "../components/LineageGraph";
 import { WhatAreTriplesCard } from "../components/WhatAreTriplesCard";
 import { WhatIsKnowledgeGraphCard } from "../components/WhatIsKnowledgeGraphCard";
@@ -791,6 +792,21 @@ export default function QueryStatisticsPage() {
     }
   }, []);
 
+  // Guard the 1s poller so at most one batch of metric requests is ever in flight.
+  // Without this, a slow backend/tunnel lets ticks pile up faster than they drain
+  // and exhaust the browser's per-origin connection pool, stalling writes.
+  //
+  // "latest-ref" pattern: the guard wrapper is created once per mount (stable inFlight
+  // flag), but always delegates to fetchMetricsLatestRef.current so it calls the
+  // current closure even if fetchMetrics gains dependencies in the future.
+  const fetchMetricsLatestRef = useRef(fetchMetrics);
+  fetchMetricsLatestRef.current = fetchMetrics;
+  const fetchMetricsGuardedRef = useRef<(() => Promise<void>) | null>(null);
+  if (fetchMetricsGuardedRef.current === null) {
+    fetchMetricsGuardedRef.current = singleFlight(() => fetchMetricsLatestRef.current());
+  }
+  const fetchMetricsGuarded = fetchMetricsGuardedRef.current;
+
   // Start polling
   const handleStartPolling = async () => {
     if (!selectedOrderId) return;
@@ -806,9 +822,9 @@ export default function QueryStatisticsPage() {
       setOrderData(null);
 
       // Start fetching metrics every second
-      metricsIntervalRef.current = window.setInterval(fetchMetrics, 1000);
+      metricsIntervalRef.current = window.setInterval(fetchMetricsGuarded, 1000);
       // Fetch immediately
-      fetchMetrics();
+      fetchMetricsGuarded();
     } catch (err) {
       console.error("Failed to start polling:", err);
       setError("Failed to start polling");

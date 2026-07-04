@@ -36,7 +36,9 @@ continuously maintained rather than periodically rebuilt.
 
 ## 1. Architecture Overview
 
-The system is CQRS with a knowledge-graph flavor:
+The system is CQRS — Command Query Responsibility Segregation: all writes go
+through one narrow, validated model, while reads come from separately-shaped
+models optimized for the questions being asked — with a knowledge-graph flavor:
 
 ```
 WRITE PATH (command side)
@@ -94,11 +96,19 @@ Key repo files, by layer:
 
 ## 2. Step 1 — Model the Domain: Ontology + Triple Store
 
-### Why triples?
+### What a triple store is, and why use one
 
-All operational data lives in **one generic table**: RDF-style
-subject–predicate–object triples. Entities are namespaced by ID prefix
-(`customer:123`, `order:FM-1001`, `inventory:BK-01-P42`).
+A **triple** is the smallest possible unit of knowledge: one fact, expressed as
+*subject – predicate – object*. "Order FM-1001 has status DELIVERED" becomes
+`(order:FM-1001, order_status, DELIVERED)`. "Order FM-1001 was placed by customer
+123" becomes `(order:FM-1001, placed_by, customer:123)`. An entity is nothing more
+than the set of triples sharing a subject; a relationship is just a triple whose
+object is another entity's ID. This is the RDF model from the semantic-web world,
+stripped to its essentials.
+
+In this repo, all operational data lives in **one generic table** of such triples.
+Entities are namespaced by ID prefix (`customer:123`, `order:FM-1001`,
+`inventory:BK-01-P42`).
 
 ```sql
 -- db/migrations/020_triples_schema.sql
@@ -119,17 +129,128 @@ CREATE INDEX idx_triples_subject_predicate ON triples(subject_id, predicate);
 CREATE INDEX idx_triples_object_value      ON triples(object_value) WHERE object_type = 'entity_ref';
 ```
 
-The payoff: **adding a new entity type or relationship requires zero schema
-migrations** — you insert ontology rows and write new views. The cost: an
-unconstrained triple table is a semantic free-for-all. That's what the ontology fixes.
+Why choose this over one relational table per entity? Four reasons, in rough
+order of importance for an *agent* platform:
+
+1. **One write path.** Every fact — regardless of entity type — enters through the
+   same table, the same API, the same validator, and the same CDC stream. An agent
+   needs exactly one write tool (`write_triples`) and one permission model, and the
+   Materialize source (Section 4) is a single publication no matter how many entity
+   types you add later.
+2. **Schema evolution without migrations.** Adding a new entity type or attribute
+   is an ontology *row insert* plus new views — no `ALTER TABLE`, no coordinated
+   deploy. When an agent platform is young, the domain model changes weekly; this
+   keeps the cost of changing your mind near zero.
+3. **The schema is data.** Because the model lives in tables rather than DDL, it is
+   *queryable at runtime* — which is what lets an agent call `get_context_graph`
+   and discover the domain (Section 9) instead of having it hard-coded in a prompt.
+4. **Facts are granular.** Change events are per-fact, not per-row. A status change
+   is one triple, and everything downstream (views, search, embeddings) can diff at
+   that granularity.
+
+The costs are real too, and you should know them going in:
+
+- **Every read is a pivot.** Reconstructing an entity means grouping and pivoting
+  triples (Section 6). Materialize makes this cheap *because it maintains the pivot
+  incrementally* — in plain Postgres at scale this pattern (classic
+  entity–attribute–value, EAV) is an anti-pattern for exactly this reason.
+- **Weak native typing.** `object_value` is TEXT; types are enforced by the
+  validator and casts, not by the column. There are no foreign keys — referential
+  integrity is the ontology validator's job.
+- **More rows.** An entity with 30 attributes is 30 rows, and `REPLICA IDENTITY
+  FULL` amplifies write traffic accordingly.
+
+**Do you need triples at all?** Be clear-eyed: the triple store is this repo's
+chosen *front door*, not a prerequisite of the pattern. Everything downstream —
+the Silver/Gold view graph, the context documents, the sinks, the agent tools —
+works identically over conventional relational tables CDC'd into Materialize. If
+you have existing systems of record with stable schemas and high volumes, point
+Materialize at those tables and skip the triple layer. Choose triples when the
+schema is volatile, when entity types are numerous and sparse, when agents (not
+just applications) write facts, or when you want the runtime-discoverable schema
+of point 3. What is *not* optional is the discipline the triple store enforces:
+one governed write path and a machine-readable description of your domain.
 
 Note the unique constraint is on the *full triple value* `(subject, predicate, object)`,
 not `(subject, predicate)`. Multi-valued vs single-valued semantics are therefore a
 choice made by the **write path** (Section 3), not the table.
 
-### The ontology: guardrails for the graph
+### Why an ontology?
 
-Two tables define what may exist:
+A bare triple table accepts anything: `(order:FM-1001, favorite_color,
+"seventeen")` is a perfectly valid row. Nothing constrains which predicates exist,
+which entities they apply to, or what their values may be. For a human-operated
+system that's sloppy; for an *agent-operated* system it's fatal, because an LLM
+under pressure will happily invent a plausible-sounding predicate
+(`remove_item`, `order_customer`) and silently corrupt the graph.
+
+The **ontology** is the schema layer that restores meaning. It is a small,
+machine-readable catalog — itself just two tables — declaring which entity types
+exist and which predicates each may carry. It serves three distinct jobs:
+
+1. **A contract for writes.** The validator (Section 3) rejects any triple that
+   doesn't conform, with a structured error explaining why. This is the guardrail
+   that makes it safe to hand an LLM a generic write tool.
+2. **A map for the agent.** The same catalog, served through `get_context_graph`,
+   tells the agent what exists and how it connects — grounding it in *your*
+   domain at runtime rather than whatever it hallucinated from training data.
+3. **Documentation that can't drift.** Because the ontology is enforced, it is by
+   construction an accurate description of the data — unlike a wiki page.
+
+If you skip the triple store in favor of relational tables, you still need jobs 2
+and 3: some machine-readable schema description the agent can discover and you can
+validate against. The ontology tables here are one lightweight way to get it.
+
+### Ontology concepts: classes, properties, and references
+
+Terminology, since it drives everything downstream:
+
+- **A class** is an entity *type* — `Customer`, `Order`, `DeliveryTask`. Each
+  class declares a `prefix` (`customer`, `order`, `task`) which acts as the
+  runtime type tag: an entity's class is determined entirely by its subject-ID
+  prefix. `order:FM-1001` *is* an Order because it starts with `order:`. There is
+  no separate "type" triple to keep consistent.
+- **A property** is a predicate that entities of one class may carry —
+  `order_status`, `placed_by`. Two attributes define its shape, borrowed from RDF:
+  - The **domain** is the class the property belongs to: `order_status` has
+    domain `Order`, so writing it on a `customer:` subject is a violation.
+  - The **range** is what values it accepts: either a literal type (`string`,
+    `int`, `float`, `bool`, `timestamp`, `date`) or — the interesting case —
+    `entity_ref`.
+- **An `entity_ref` property is a typed foreign key.** Its value is another
+  entity's subject ID, and its `range_class_id` declares which class that entity
+  must belong to: `placed_by` has domain `Order` and range `Customer`, so
+  `(order:FM-1001, placed_by, courier:7)` is rejected. These properties *are* the
+  edges of your knowledge graph; everything else is node attributes.
+- **Inheritance** is available via `parent_class_id` — a subclass satisfies its
+  parent's domain and range checks (the validator walks the hierarchy). Use it
+  sparingly; FreshMart doesn't need it.
+
+**When does a relationship deserve its own class?** FreshMart models
+`home_store` as a simple `entity_ref` from Customer to Store, but models
+delivery as a full `DeliveryTask` class rather than a `delivered_by` edge from
+Order to Courier. The heuristic: **reify a relationship into a class when the
+relationship itself carries state or lifecycle you must track.** A delivery has
+its own status, ETA, start/completion times — facts *about the relationship*,
+not about either endpoint. Likewise `OrderLine` exists because "order contains
+product" carries quantity, a price snapshot, and a sequence. If the relationship
+is just a pointer, keep it a property; the moment you want to hang attributes on
+it, make it a class.
+
+**Declared vs enforced.** The ontology also records `is_required` and
+`is_multi_valued` per property. Know that in this repo these are *descriptive
+metadata* — surfaced to the UI and the agent for form generation and prompting —
+not validator-enforced rules. Cardinality is enforced structurally by choosing
+the right write path (Section 3): the replacing upsert guarantees single-valued
+semantics, the additive batch permits multi-valued ones. If a duplicate does
+sneak in through the additive path, the flat views' `MAX(...)` pivot (Section 6)
+degrades gracefully by picking one value deterministically. If your domain needs
+hard cardinality or required-field enforcement, add those checks to the
+validator — the seam is already there.
+
+### The ontology tables
+
+The whole catalog is two tables:
 
 ```sql
 -- db/migrations/010_ontology_schema.sql
@@ -156,12 +277,11 @@ CREATE TABLE ontology_properties (
 );
 ```
 
-- **Domain** = which class a predicate applies to (`order_status` belongs to `Order`).
-- **Range** = the value's type; for `entity_ref`, the class the referenced entity must
-  belong to (`placed_by` must point at a `Customer`).
-- `prop_name` is globally unique — predicate names double as documentation
-  (`customer_name`, `store_zone`), which also makes the flattening views (Section 6)
-  unambiguous.
+Beyond the domain/range machinery described above, one design choice is worth
+noting: `prop_name` is globally unique, not per-class. Predicate names therefore
+double as documentation (`customer_name`, `store_zone` — not a generic `name`
+reused across classes), which also makes the flattening views (Section 6)
+unambiguous: a predicate identifies exactly one column of exactly one entity type.
 
 ### The FreshMart ontology (representative example)
 
@@ -172,7 +292,7 @@ Eight classes model the delivery business (`db/seed/demo_ontology_freshmart.sql`
 | Customer | `customer` | `customer_name`, `customer_email`, `customer_address`, `home_store` → Store |
 | Store | `store` | `store_name`, `store_zone`, `store_status`, `store_capacity_orders_per_hour` |
 | Product | `product` | `product_name`, `category`, `perishable`, `unit_price`, `unit_weight_grams` |
-| InventoryItem | `inventory` | `inventory_store` → Store, `inventory_product` → Product, `stock_level`, plus derived pricing fields |
+| InventoryItem | `inventory` | `inventory_store` → Store, `inventory_product` → Product, `stock_level` |
 | Order | `order` | `order_number`, `placed_by` → Customer, `order_store` → Store, `order_status`, `delivery_window_*`, `order_created_at` |
 | OrderLine | `orderline` | `line_of_order` → Order, `line_product` → Product, `quantity`, `order_line_unit_price`, `line_sequence` |
 | Courier | `courier` | `courier_name`, `vehicle_type`, `courier_status`, `courier_home_store` → Store |
@@ -361,7 +481,12 @@ rows = await conn.fetch("SELECT ... FROM store_capacity_health_mv ...")
 ## 6. Step 5 — Build the View Graph (Bronze → Silver → Gold)
 
 This is the heart of context engineering: a DAG of SQL views that turns raw triples
-into agent-ready documents. The medallion framing maps cleanly:
+into agent-ready documents. It's convenient to describe the DAG in the "medallion"
+vocabulary from the lakehouse world — successive layers that refine raw data
+(Bronze) into cleaned entities (Silver) into business-ready shapes (Gold). The
+crucial difference from a lakehouse: here the layers are not periodically rebuilt
+batch tables but views Materialize maintains incrementally, so "Gold" is always
+current. The mapping:
 
 - **Bronze** — the replicated `triples` table.
 - **Silver** — "flat" entity views that pivot triples into wide rows.
@@ -438,8 +563,12 @@ Two more Gold patterns worth stealing:
 
 ### Rolling windows with `mz_now()`
 
-For time-series context (queue depth, wait times per store), the repo uses temporal
-filters so windows slide automatically with no cron:
+`mz_now()` is not Postgres's `now()`: it returns Materialize's current *logical
+timestamp* (milliseconds since epoch), and a `WHERE` clause containing it is a
+**temporal filter** that Materialize continuously re-evaluates as time advances —
+rows enter and leave the view on their own as the clock moves. That's what makes
+rolling windows work with no cron and no rebuild. For time-series context (queue
+depth, wait times per store):
 
 ```sql
 CREATE MATERIALIZED VIEW store_metrics_by_window_mv IN CLUSTER compute AS
@@ -452,8 +581,10 @@ GROUP BY ob.store_id, ob.window_end;
 ```
 
 Constraint to remember: `mz_now()` may appear only in `WHERE`/`HAVING` — you cannot
-`EXTRACT(HOUR FROM mz_now())` in a SELECT/CASE. (That's why the demo's Materialize
-pricing has 8 factors while the Postgres comparison view has a 9th time-of-day factor.)
+`EXTRACT(HOUR FROM mz_now())` in a SELECT/CASE. Signals that need wall-clock
+arithmetic in a projection (like a time-of-day pricing factor) must live outside
+Materialize; the dynamic pricing engine in the next section has 8 factors rather
+than 9 for exactly this reason.
 
 ---
 
@@ -488,10 +619,14 @@ Two implementation notes from this repo:
   `available_quantity = GREATEST(stock - reserved, 0)` — the pricing view keys off
   *available*, not raw stock.
 - The composite index
-  `inventory_pricing_store_product_idx (store_id, product_id)` exists specifically so
-  the per-order pricing join (next section) is a differential join over an existing
-  arrangement rather than a scan; the repo measured ~5× p99 inflation without it.
-  **Index the join keys your Gold views actually use.**
+  `inventory_pricing_store_product_idx (store_id, product_id)` exists specifically
+  for the per-order pricing join (next section). In Materialize, an index builds an
+  **arrangement** — an in-memory copy of the view's output, maintained and keyed by
+  the indexed columns. A join that lines up with an existing arrangement processes
+  each change by looking up matching keys ("differential join"); without one,
+  Materialize must build that keyed state itself or re-scan input on every update.
+  The repo measured ~5× p99 inflation without this index. **Index the join keys
+  your Gold views actually use.**
 
 The agent never computes prices. Its system prompt says: *always quote `live_price`,
 never `base_price`* — the context layer owns the business logic; the agent just reads it.
@@ -570,6 +705,25 @@ Design principles embodied here:
   in Section 10.
 - **Guard the aggregates**: `FILTER (WHERE ol.line_id IS NOT NULL)` +
   `COALESCE(..., '[]')` yields `[]` for empty orders, not `[null]`.
+
+### How big should a context document be?
+
+The "one row = one answer" heuristic has a limit: the row ultimately lands in an
+LLM's context window. A grocery order has a handful of line items, so nesting them
+all is fine; if your equivalent entity has hundreds of children or years of
+history (claims with long correspondence threads, accounts with full transaction
+logs), don't `jsonb_agg` the world into one row. Guidelines:
+
+- **Nest the one-to-many tail only when it's bounded** and the agent usually needs
+  all of it (order lines: yes; audit history: no).
+- **Aggregate what the agent needs from an unbounded tail instead of embedding
+  it** — counts, sums, flags, most-recent-N — the way this view carries
+  `line_item_count` and `has_perishable_items` rather than raw events.
+- **Split along question boundaries.** If two questions ("what's in this order?"
+  vs "what happened to this order over time?") need different tails, give each its
+  own view and its own agent tool rather than one mega-document.
+- The row is cheap for Materialize to maintain either way; the budget you're
+  protecting is the agent's tokens and attention, not the database.
 
 ---
 
@@ -821,11 +975,16 @@ still evolving). Downstream services (`materialize-zero`, `zero-cache`, connect
 bootstrap) depend on `service_completed_successfully`. Treat your view graph as code
 with a deterministic bootstrap.
 
-**Frontiers must advance — stub your optional views.** The delivery-bundling MVs
-(`WITH MUTUALLY RECURSIVE`, ~460s of compute) are opt-in. When disabled, they're
-replaced by **stub MVs with identical schemas that still reference an upstream table**
-(`... FROM orders_flat_mv WHERE order_id = '__stub_never_matches__'`). An empty view
-with no upstream would have a stuck frontier and block any SUBSCRIBE that includes it.
+**Frontiers must advance — stub your optional views.** A view's *frontier* is the
+timestamp up to which its output is known complete; it advances as the view's
+inputs advance, and `SUBSCRIBE` can only emit data once every involved frontier has
+passed the requested time. The delivery-bundling MVs (`WITH MUTUALLY RECURSIVE`,
+~460s of compute) are opt-in; when disabled, they're replaced by **stub MVs with
+identical schemas that still reference an upstream table**
+(`... FROM orders_flat_mv WHERE order_id = '__stub_never_matches__'`). An empty
+view with no upstream has no inputs driving its frontier forward, so it would
+stall any SUBSCRIBE that includes it — the stub keeps the frontier moving while
+returning zero rows.
 
 **Index the arrangements your joins need.** The composite index on
 `(store_id, product_id)` for the pricing view turned the per-order pricing join into a
@@ -862,8 +1021,10 @@ A build order that works:
 1. **Write the ontology.** List your business nouns (classes + prefixes) and their
    properties with domain/range. Start with 5–10 classes. Seed `ontology_classes` /
    `ontology_properties`.
-2. **Stand up the triple store + write API.** Copy the DDL and the three write paths;
-   wire the validator. Get `POST /triples` returning structured validation errors.
+2. **Stand up the triple store + write API** — or, if you decided against triples
+   (see the decision box in Section 2), point CDC at your existing tables and keep
+   only the ontology tables as the agent-discoverable schema. Either way, wire the
+   validator and get writes returning structured validation errors.
 3. **Connect Materialize.** `wal_level=logical`, `REPLICA IDENTITY FULL`, one
    publication, one source, three clusters.
 4. **Write Silver flat views** — one pivot view per class, casts at the edge,
@@ -884,10 +1045,11 @@ What to change vs keep:
 
 - **Change:** the ontology, the flat views, the context-document shapes, the derived
   signals, the tool set, the embedding text definition.
-- **Keep:** the triple table + validator, the three-cluster layout, the regular-view /
-  materialized-view / index conventions, `effective_updated_at` propagation, the
-  `*_sink_v` + Debezium + diff-embed pipeline, RETAIN HISTORY discipline, the
-  idempotent init container.
+- **Keep:** the ontology as a runtime-queryable, validator-enforced schema (whether
+  or not you keep the triple table under it), the three-cluster layout, the
+  regular-view / materialized-view / index conventions, `effective_updated_at`
+  propagation, the `*_sink_v` + Debezium + diff-embed pipeline, RETAIN HISTORY
+  discipline, the idempotent init container.
 
 The one-sentence summary: **model facts once, validate them at the door, let
 Materialize continuously assemble them into the shapes your agents need, and make every

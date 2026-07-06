@@ -1,1834 +1,387 @@
-#!/bin/bash
-# Initialize Materialize with Three-Tier Architecture
-# Run this after docker-compose up to set up Materialize
+#!/bin/sh
+# Initialize Materialize: the live context graph over the UPS historian.
 #
-# Architecture:
-#   ingest cluster  -> Sources (PostgreSQL logical replication)
-#   compute cluster -> Materialized views (persist transformation results)
-#   serving cluster -> Indexes (serve queries with low latency)
+# Three-tier cluster architecture:
+#   ingest  -> the SQL Server CDC source
+#   compute -> materialized views (the silver/gold transformations)
+#   serving -> indexes that answer point lookups in milliseconds
 #
 # Pattern:
-#   - Regular views for intermediate transformations (no cluster)
-#   - Materialized views IN CLUSTER compute for "topmost" views that serve results
-#   - Indexes IN CLUSTER serving ON materialized views
-
+#   - Regular views for intermediate ("silver") latest-state transformations
+#   - Materialized views IN CLUSTER compute for the "gold" context views
+#   - Indexes IN CLUSTER serving on whatever the API/copilot reads
 set -e
 
 MZ_HOST=${MZ_HOST:-localhost}
 MZ_PORT=${MZ_PORT:-6875}
-MZ_SYSTEM_PORT=${MZ_SYSTEM_PORT:-6877}
+MZ_SQLSERVER_PASSWORD=${MZ_SQLSERVER_PASSWORD:?MZ_SQLSERVER_PASSWORD is required}
+
+run() {
+    psql -v ON_ERROR_STOP=1 -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -q -c "$1"
+}
 
 echo "Waiting for Materialize to be ready..."
 until psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "SELECT 1" > /dev/null 2>&1; do
-    echo "Materialize is not ready yet, waiting..."
     sleep 2
 done
-echo "Materialize is ready!"
+echo "Materialize is ready."
 
-echo "Setting up Three-Tier Architecture clusters..."
-
-# Size Materialize clusters to use at most 50% of available CPUs.
-# Each 50cc = 1 core. Fixed clusters: ingest (50cc/1 core) + serving (100cc/2 cores) = 3 cores.
-# Compute gets the remainder of the 50% budget, capped at 400cc.
-TOTAL_CPUS=$(nproc)
-MZ_BUDGET=$(( TOTAL_CPUS / 2 ))
-FIXED_CORES=3  # ingest (1) + serving (2)
-COMPUTE_CORES=$(( MZ_BUDGET - FIXED_CORES ))
-if (( COMPUTE_CORES < 1 )); then
-    COMPUTE_CORES=1
+if psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SHOW SOURCES" 2>/dev/null | grep -q ups_source; then
+    echo "Source ups_source already exists; skipping initialization."
+    exit 0
 fi
 
-# Convert cores to cc (1 core = 50cc), capped at 400cc
-COMPUTE_CC=$(( COMPUTE_CORES * 50 ))
-if (( COMPUTE_CC > 400 )); then
-    COMPUTE_CC=400
-fi
+echo "Creating clusters..."
+run "CREATE CLUSTER ingest (SIZE = '50cc');" || true
+run "CREATE CLUSTER compute (SIZE = '100cc');" || true
+run "CREATE CLUSTER serving (SIZE = '100cc');" || true
 
-# Snap to nearest valid cc size (50, 100, 200, 300, 400)
-if (( COMPUTE_CC >= 400 )); then
-    COMPUTE_CLUSTER_SIZE="400cc"
-elif (( COMPUTE_CC >= 300 )); then
-    COMPUTE_CLUSTER_SIZE="300cc"
-elif (( COMPUTE_CC >= 200 )); then
-    COMPUTE_CLUSTER_SIZE="200cc"
-elif (( COMPUTE_CC >= 100 )); then
-    COMPUTE_CLUSTER_SIZE="100cc"
-else
-    COMPUTE_CLUSTER_SIZE="50cc"
-fi
-
-echo "Detected $TOTAL_CPUS CPUs, MZ budget: $MZ_BUDGET cores (50%), compute: $COMPUTE_CLUSTER_SIZE"
-
-# Resize built-in catalog server cluster (default is 50cc)
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "ALTER CLUSTER mz_catalog_server SET (SIZE = '100cc');" 2>/dev/null || echo "mz_catalog_server resize skipped"
-
-# Create clusters (ignore errors if already exist)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE CLUSTER ingest (SIZE = '50cc');" 2>/dev/null || echo "ingest cluster already exists"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE CLUSTER compute (SIZE = '$COMPUTE_CLUSTER_SIZE');" 2>/dev/null || echo "compute cluster already exists"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE CLUSTER serving (SIZE = '100cc');" 2>/dev/null || echo "serving cluster already exists"
-
-# Grant usage on all clusters to materialize user
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "GRANT USAGE ON CLUSTER ingest TO materialize;" 2>/dev/null || echo "ingest usage already granted"
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "GRANT USAGE ON CLUSTER compute TO materialize;" 2>/dev/null || echo "compute usage already granted"
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "GRANT USAGE ON CLUSTER serving TO materialize;" 2>/dev/null || echo "serving usage already granted"
-
-# Set serving as the default cluster and drop quickstart
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "ALTER SYSTEM SET cluster = 'serving';" 2>/dev/null || echo "default cluster already set"
-psql -h "$MZ_HOST" -p "$MZ_SYSTEM_PORT" -U mz_system -c "DROP CLUSTER IF EXISTS quickstart CASCADE;" || echo "quickstart cluster already dropped"
-
-echo "Creating PostgreSQL connection..."
-
-# Create secret
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE SECRET IF NOT EXISTS pgpass AS 'postgres';"
-
-# Create connection
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE CONNECTION IF NOT EXISTS pg_connection TO POSTGRES (
-    HOST 'db',
-    PORT 5432,
-    USER 'postgres',
-    PASSWORD SECRET pgpass,
-    DATABASE 'freshmart'
+echo "Creating SQL Server connection..."
+run "CREATE SECRET IF NOT EXISTS sqlserver_pass AS '${MZ_SQLSERVER_PASSWORD}';"
+run "CREATE CONNECTION IF NOT EXISTS sqlserver_connection TO SQL SERVER (
+    HOST 'sqlserver',
+    PORT 1433,
+    USER 'materialize',
+    PASSWORD SECRET sqlserver_pass,
+    DATABASE 'ups'
 );"
 
-echo "Creating source IN CLUSTER ingest..."
-
-# Create source in ingest cluster
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE SOURCE IF NOT EXISTS pg_source
+echo "Creating source (snapshots all CDC-enabled tables)..."
+run "CREATE SOURCE ups_source
     IN CLUSTER ingest
-    FROM POSTGRES CONNECTION pg_connection (PUBLICATION 'mz_source')
-    WITH (TIMESTAMP INTERVAL = '100ms');"
+    FROM SQL SERVER CONNECTION sqlserver_connection
+    FOR ALL TABLES;"
 
-# Create table from source (new v26 syntax, replaces FOR ALL TABLES).
-# RETAIN HISTORY 5min is required so SUBSCRIBEs from materialize-zero don't
-# fail with `Timestamp not valid for all inputs`. ALTER TABLE doesn't work
-# on source-derived tables (mz bug — planner accepts but catalog rejects),
-# so retention must be set at CREATE time.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE TABLE IF NOT EXISTS triples
-    FROM SOURCE pg_source (REFERENCE public.triples)
-    WITH (RETAIN HISTORY FOR '5 minutes');"
+echo "Waiting for the initial snapshot (facilities visible)..."
+i=0
+until [ "$(psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -A -c 'SELECT COUNT(*) FROM facilities' 2>/dev/null)" -gt 0 ] 2>/dev/null; do
+    i=$((i + 1))
+    if [ $i -gt 120 ]; then
+        echo "Snapshot did not complete within 4 minutes" >&2
+        exit 1
+    fi
+    sleep 2
+done
+echo "Snapshot complete."
 
-echo "Waiting for source to hydrate..."
-sleep 5
+# ============================================================
+# Silver: latest-state views over the raw CDC tables.
+# Regular (non-materialized) views: they are fused into the gold
+# dataflows, so they cost nothing on their own.
+# ============================================================
+echo "Creating silver views..."
 
-echo "Creating index on triples source for subject_id lookups..."
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS triples_subject_idx IN CLUSTER serving ON triples (subject_id);"
+# Latest sample per historian tag. Temporal filter keeps the arrangement
+# bounded on the append-only table (simulator prunes at 60 min; 15 min here).
+run "CREATE VIEW latest_tag_values AS
+SELECT DISTINCT ON (tag_id) tag_id, ts, value
+FROM tag_values
+WHERE mz_now() <= ts + INTERVAL '15 minutes'
+ORDER BY tag_id, ts DESC;"
 
-echo "Creating regular views for intermediate transformations..."
-
-# Create regular views (one at a time due to Materialize transaction requirements)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS customers_flat AS
+# 5-minute rolling stats per (equipment, tag).
+run "CREATE VIEW equipment_tag_stats_5m AS
 SELECT
-    subject_id AS customer_id,
-    MAX(CASE WHEN predicate = 'customer_name' THEN object_value END) AS customer_name,
-    MAX(CASE WHEN predicate = 'customer_email' THEN object_value END) AS customer_email,
-    MAX(CASE WHEN predicate = 'customer_address' THEN object_value END) AS customer_address,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'customer:%'
-GROUP BY subject_id;"
+    t.equipment_id,
+    t.tag_name,
+    t.unit,
+    AVG(v.value) AS avg_value,
+    MIN(v.value) AS min_value,
+    MAX(v.value) AS max_value,
+    COUNT(*) AS sample_count,
+    MAX(v.ts) AS latest_ts
+FROM tag_values v
+JOIN tags t ON t.tag_id = v.tag_id
+WHERE mz_now() <= v.ts + INTERVAL '5 minutes'
+GROUP BY t.equipment_id, t.tag_name, t.unit;"
 
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS stores_flat AS
+run "CREATE VIEW active_alarms AS
 SELECT
-    subject_id AS store_id,
-    MAX(CASE WHEN predicate = 'store_name' THEN object_value END) AS store_name,
-    MAX(CASE WHEN predicate = 'store_zone' THEN object_value END) AS store_zone,
-    MAX(CASE WHEN predicate = 'store_address' THEN object_value END) AS store_address,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'store:%'
-GROUP BY subject_id;"
+    a.alarm_id,
+    a.equipment_id,
+    e.facility_id,
+    e.equipment_type,
+    a.alarm_type,
+    a.severity,
+    a.message,
+    a.raised_at,
+    a.acknowledged,
+    a.acknowledged_by
+FROM alarms a
+JOIN equipment e ON e.equipment_id = a.equipment_id
+WHERE a.cleared_at IS NULL;"
 
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS delivery_tasks_flat AS
+run "CREATE VIEW equipment_alarm_agg AS
 SELECT
-    subject_id AS task_id,
-    MAX(CASE WHEN predicate = 'task_of_order' THEN object_value END) AS order_id,
-    MAX(CASE WHEN predicate = 'assigned_to' THEN object_value END) AS assigned_courier_id,
-    MAX(CASE WHEN predicate = 'task_status' THEN object_value END) AS task_status,
-    MAX(CASE WHEN predicate = 'task_started_at' THEN object_value END)::TIMESTAMPTZ AS task_started_at,
-    MAX(CASE WHEN predicate = 'task_completed_at' THEN object_value END)::TIMESTAMPTZ AS task_completed_at,
-    MAX(CASE WHEN predicate = 'eta' THEN object_value END) AS eta,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'task:%'
-GROUP BY subject_id;"
+    equipment_id,
+    COUNT(*) AS active_alarm_count,
+    COUNT(*) FILTER (WHERE severity = 'CRITICAL') AS critical_alarm_count,
+    MAX(CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END) AS severity_rank
+FROM alarms
+WHERE cleared_at IS NULL
+GROUP BY equipment_id;"
 
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS products_flat AS
+# Most recent still-active alarm per equipment (for human-readable context).
+run "CREATE VIEW latest_active_alarm AS
+SELECT DISTINCT ON (equipment_id)
+    equipment_id, alarm_id, alarm_type, severity, message, raised_at
+FROM alarms
+WHERE cleared_at IS NULL
+ORDER BY equipment_id, raised_at DESC;"
+
+run "CREATE VIEW latest_package_scan AS
+SELECT DISTINCT ON (package_id) package_id, facility_id, equipment_id, scan_type, ts
+FROM scan_events
+WHERE mz_now() <= ts + INTERVAL '24 hours'
+ORDER BY package_id, ts DESC;"
+
+run "CREATE VIEW vehicle_fault_agg AS
 SELECT
-    subject_id AS product_id,
-    MAX(CASE WHEN predicate = 'product_name' THEN object_value END) AS product_name,
-    MAX(CASE WHEN predicate = 'category' THEN object_value END) AS category,
-    MAX(CASE WHEN predicate = 'unit_price' THEN object_value END)::DECIMAL(10,2) AS unit_price,
-    MAX(CASE WHEN predicate = 'perishable' THEN object_value END)::BOOLEAN AS perishable,
-    MAX(CASE WHEN predicate = 'unit_weight_grams' THEN object_value END)::INT AS unit_weight_grams,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'product:%'
-GROUP BY subject_id;"
+    vf.vehicle_id,
+    COUNT(*) AS active_fault_count,
+    COUNT(*) FILTER (WHERE fc.severity = 'CRITICAL') AS critical_fault_count,
+    MAX(CASE fc.severity WHEN 'CRITICAL' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END) AS severity_rank,
+    string_agg(vf.code, ', ' ORDER BY vf.occurred_at) AS fault_codes
+FROM vehicle_faults vf
+JOIN fault_codes fc ON fc.code = vf.code
+WHERE vf.cleared_at IS NULL
+GROUP BY vf.vehicle_id;"
 
-echo "Creating materialized views IN CLUSTER compute..."
+run "CREATE VIEW open_work_orders_agg AS
+SELECT vehicle_id, COUNT(*) AS open_work_orders
+FROM maintenance_orders
+WHERE status IN ('OPEN', 'IN_PROGRESS')
+GROUP BY vehicle_id;"
 
-# Create materialized views in compute cluster
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS orders_flat_mv IN CLUSTER compute AS
-WITH order_line_amounts AS (
-    -- Calculate line_amount from quantity * unit_price (derived, not stored)
-    SELECT
-        subject_id AS line_id,
-        MAX(CASE WHEN predicate = 'line_of_order' THEN object_value END) AS order_id,
-        (MAX(CASE WHEN predicate = 'quantity' THEN object_value END)::INT
-         * MAX(CASE WHEN predicate = 'order_line_unit_price' THEN object_value END)::DECIMAL(10,2))::DECIMAL(10,2) AS line_amount
-    FROM triples
-    WHERE subject_id LIKE 'orderline:%'
-    GROUP BY subject_id
-),
-order_totals AS (
-    -- Aggregate line amounts per order BEFORE joining with order triples
-    SELECT
-        order_id,
-        COALESCE(SUM(line_amount), 0.00)::DECIMAL(10,2) AS computed_total
-    FROM order_line_amounts
-    GROUP BY order_id
-)
-SELECT
-    o.subject_id AS order_id,
-    MAX(CASE WHEN o.predicate = 'order_number' THEN o.object_value END) AS order_number,
-    MAX(CASE WHEN o.predicate = 'order_status' THEN o.object_value END) AS order_status,
-    MAX(CASE WHEN o.predicate = 'order_store' THEN o.object_value END) AS store_id,
-    MAX(CASE WHEN o.predicate = 'placed_by' THEN o.object_value END) AS customer_id,
-    MAX(CASE WHEN o.predicate = 'delivery_window_start' THEN o.object_value END) AS delivery_window_start,
-    MAX(CASE WHEN o.predicate = 'delivery_window_end' THEN o.object_value END) AS delivery_window_end,
-    MAX(CASE WHEN o.predicate = 'order_created_at' THEN o.object_value END)::TIMESTAMPTZ AS order_created_at,
-    -- COMPUTED from line items (not from triple) - auto-calculated, always accurate
-    COALESCE(ot.computed_total, 0.00)::DECIMAL(10,2) AS order_total_amount,
-    MAX(o.updated_at) AS effective_updated_at
-FROM triples o
-LEFT JOIN order_totals ot ON ot.order_id = o.subject_id
-WHERE o.subject_id LIKE 'order:%'
-GROUP BY o.subject_id, ot.computed_total;"
+# ============================================================
+# Gold: cross-silo context views. These are what make the "context
+# graph" real — one row pre-joins historian + ops + fleet.
+# ============================================================
+echo "Creating gold materialized views..."
 
-echo "Creating order line views..."
-
-# Order lines base view
-# Note: perishable_flag is NOT stored here - it is derived from products in order_lines_flat_mv
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS order_lines_base AS
-SELECT
-    subject_id AS line_id,
-    MAX(CASE WHEN predicate = 'line_of_order' THEN object_value END) AS order_id,
-    MAX(CASE WHEN predicate = 'line_product' THEN object_value END) AS product_id,
-    MAX(CASE WHEN predicate = 'quantity' THEN object_value END)::INT AS quantity,
-    MAX(CASE WHEN predicate = 'order_line_unit_price' THEN object_value END)::DECIMAL(10,2) AS unit_price,
-    -- Calculate line_amount from quantity * unit_price (derived, not stored)
-    (MAX(CASE WHEN predicate = 'quantity' THEN object_value END)::INT
-     * MAX(CASE WHEN predicate = 'order_line_unit_price' THEN object_value END)::DECIMAL(10,2))::DECIMAL(10,2) AS line_amount,
-    MAX(CASE WHEN predicate = 'line_sequence' THEN object_value END)::INT AS line_sequence,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'orderline:%'
-GROUP BY subject_id;"
-
-# Order lines flat materialized view with product enrichment
-# perishable_flag is DERIVED from products_flat.perishable (not stored on order line)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS order_lines_flat_mv IN CLUSTER compute AS
-SELECT
-    ol.line_id,
-    ol.order_id,
-    ol.product_id,
-    ol.quantity,
-    ol.unit_price,
-    ol.line_amount,
-    ol.line_sequence,
-    p.perishable AS perishable_flag,  -- Derived from product
-    p.product_name,
-    p.category,
-    p.unit_price AS current_product_price,
-    p.unit_weight_grams,
-    GREATEST(ol.effective_updated_at, p.effective_updated_at) AS effective_updated_at
-FROM order_lines_base ol
-LEFT JOIN products_flat p ON p.product_id = ol.product_id;"
-
-# Drop first to ensure schema updates are applied
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "DROP MATERIALIZED VIEW IF EXISTS store_inventory_mv CASCADE;" 2>/dev/null
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW store_inventory_mv IN CLUSTER compute AS
-WITH order_reservations AS (
-    -- Calculate reserved quantity per product per store from pending orders
-    SELECT
-        o.store_id,
-        ol.product_id,
-        SUM(ol.quantity) AS reserved_quantity
-    FROM order_lines_flat_mv ol
-    JOIN orders_flat_mv o ON o.order_id = ol.order_id
-    WHERE o.order_status IN ('CREATED', 'PICKING', 'OUT_FOR_DELIVERY')
-    GROUP BY o.store_id, ol.product_id
-)
-SELECT
-    inv.inventory_id,
-    inv.store_id,
-    inv.product_id,
-    inv.stock_level,
-    -- NEW: Reserved quantity from pending orders
-    COALESCE(res.reserved_quantity, 0)::INT AS reserved_quantity,
-    -- NEW: Available quantity (stock minus reservations)
-    GREATEST(inv.stock_level - COALESCE(res.reserved_quantity, 0), 0)::INT AS available_quantity,
-    inv.replenishment_eta,
-    inv.effective_updated_at,
-    -- Product details
-    p.product_name,
-    p.category,
-    p.unit_price,
-    p.perishable,
-    p.unit_weight_grams,
-    -- Store details
-    s.store_name,
-    s.store_zone,
-    s.store_address,
-    -- Availability flags (based on AVAILABLE quantity, not total stock)
-    CASE
-        WHEN GREATEST(inv.stock_level - COALESCE(res.reserved_quantity, 0), 0) > 10 THEN 'IN_STOCK'
-        WHEN GREATEST(inv.stock_level - COALESCE(res.reserved_quantity, 0), 0) > 0 THEN 'LOW_STOCK'
-        ELSE 'OUT_OF_STOCK'
-    END AS availability_status,
-    (GREATEST(inv.stock_level - COALESCE(res.reserved_quantity, 0), 0) <= 10
-     AND GREATEST(inv.stock_level - COALESCE(res.reserved_quantity, 0), 0) > 0) AS low_stock
-FROM (
-    SELECT
-        subject_id AS inventory_id,
-        MAX(CASE WHEN predicate = 'inventory_store' THEN object_value END) AS store_id,
-        MAX(CASE WHEN predicate = 'inventory_product' THEN object_value END) AS product_id,
-        MAX(CASE WHEN predicate = 'stock_level' THEN object_value END)::INT AS stock_level,
-        MAX(CASE WHEN predicate = 'replenishment_eta' THEN object_value END) AS replenishment_eta,
-        MAX(updated_at) AS effective_updated_at
-    FROM triples
-    WHERE subject_id LIKE 'inventory:%'
-    GROUP BY subject_id
-) inv
-LEFT JOIN order_reservations res ON res.store_id = inv.store_id AND res.product_id = inv.product_id
-LEFT JOIN products_flat p ON p.product_id = inv.product_id
-LEFT JOIN stores_flat s ON s.store_id = inv.store_id;"
-
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS orders_search_source_mv IN CLUSTER compute AS
-SELECT
-    o.order_id,
-    o.order_number,
-    o.order_status,
-    o.store_id,
-    o.customer_id,
-    o.delivery_window_start,
-    o.delivery_window_end,
-    o.order_total_amount,
-    c.customer_name,
-    c.customer_email,
-    c.customer_address,
-    s.store_name,
-    s.store_zone,
-    s.store_address,
-    dt.assigned_courier_id,
-    dt.task_status AS delivery_task_status,
-    dt.eta AS delivery_eta,
-    GREATEST(o.effective_updated_at, c.effective_updated_at, s.effective_updated_at, dt.effective_updated_at) AS effective_updated_at
-FROM orders_flat_mv o
-LEFT JOIN customers_flat c ON c.customer_id = o.customer_id
-LEFT JOIN stores_flat s ON s.store_id = o.store_id
-LEFT JOIN delivery_tasks_flat dt ON dt.order_id = o.order_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS order_timestamps AS
-SELECT
-    subject_id AS order_id,
-    MAX(CASE WHEN predicate = 'order_created_at' THEN object_value END) AS order_created_at,
-    MAX(CASE WHEN predicate = 'delivered_at' THEN object_value END) AS delivered_at
-FROM triples
-WHERE subject_id LIKE 'order:%'
-GROUP BY subject_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS courier_tasks_flat AS
-SELECT
-    t_assigned.object_value AS courier_id,
-    t_task.subject_id AS task_id,
-    MAX(CASE WHEN t_task.predicate = 'task_status' THEN t_task.object_value END) AS task_status,
-    MAX(CASE WHEN t_task.predicate = 'task_of_order' THEN t_task.object_value END) AS order_id,
-    MAX(CASE WHEN t_task.predicate = 'eta' THEN t_task.object_value END) AS eta,
-    MAX(CASE WHEN t_task.predicate = 'route_sequence' THEN t_task.object_value END)::INT AS route_sequence
-FROM triples t_assigned
-JOIN triples t_task ON t_task.subject_id = t_assigned.subject_id
-WHERE t_assigned.predicate = 'assigned_to'
-    AND t_assigned.object_type = 'entity_ref'
-GROUP BY t_assigned.object_value, t_task.subject_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS courier_tasks_with_timestamps AS
-SELECT
-    ct.courier_id,
-    ct.task_id,
-    ct.task_status,
-    ct.order_id,
-    ct.eta,
-    ct.route_sequence,
-    ot.order_created_at,
-    ot.delivered_at,
-    dt.task_started_at,
-    dt.task_completed_at,
-    CASE
-        WHEN ot.delivered_at IS NOT NULL AND ot.order_created_at IS NOT NULL
-        THEN EXTRACT(EPOCH FROM (ot.delivered_at::TIMESTAMPTZ - ot.order_created_at::TIMESTAMPTZ)) / 60
-        ELSE NULL
-    END AS wait_time_minutes
-FROM courier_tasks_flat ct
-LEFT JOIN order_timestamps ot ON ot.order_id = ct.order_id
-LEFT JOIN delivery_tasks_flat dt ON dt.task_id = ct.task_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS couriers_flat AS
-SELECT
-    subject_id AS courier_id,
-    MAX(CASE WHEN predicate = 'courier_name' THEN object_value END) AS courier_name,
-    MAX(CASE WHEN predicate = 'courier_home_store' THEN object_value END) AS home_store_id,
-    MAX(CASE WHEN predicate = 'vehicle_type' THEN object_value END) AS vehicle_type,
-    MAX(CASE WHEN predicate = 'courier_status' THEN object_value END) AS courier_status,
-    MAX(CASE WHEN predicate = 'courier_status_changed_at' THEN object_value END) AS status_changed_at,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'courier:%'
-GROUP BY subject_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS courier_schedule_mv IN CLUSTER compute AS
-SELECT
-    cf.courier_id,
-    cf.courier_name,
-    cf.home_store_id,
-    cf.vehicle_type,
-    cf.courier_status,
-    cf.status_changed_at,
-    COALESCE(
-        jsonb_agg(
-            jsonb_build_object(
-                'task_id', ct.task_id,
-                'task_status', ct.task_status,
-                'order_id', ct.order_id,
-                'eta', ct.eta,
-                'wait_time_minutes', ct.wait_time_minutes,
-                'order_created_at', ct.order_created_at,
-                'task_started_at', ct.task_started_at,
-                'task_completed_at', ct.task_completed_at
-            )
-        ) FILTER (WHERE ct.task_id IS NOT NULL),
-        '[]'::jsonb
-    ) AS tasks,
-    cf.effective_updated_at
-FROM couriers_flat cf
-LEFT JOIN courier_tasks_with_timestamps ct ON ct.courier_id = cf.courier_id
-GROUP BY cf.courier_id, cf.courier_name, cf.home_store_id, cf.vehicle_type, cf.courier_status, cf.status_changed_at, cf.effective_updated_at;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS stores_mv IN CLUSTER compute AS
-SELECT
-    subject_id AS store_id,
-    MAX(CASE WHEN predicate = 'store_name' THEN object_value END) AS store_name,
-    MAX(CASE WHEN predicate = 'store_zone' THEN object_value END) AS store_zone,
-    MAX(CASE WHEN predicate = 'store_address' THEN object_value END) AS store_address,
-    MAX(CASE WHEN predicate = 'store_status' THEN object_value END) AS store_status,
-    MAX(CASE WHEN predicate = 'store_capacity_orders_per_hour' THEN object_value END)::INT AS store_capacity_orders_per_hour,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'store:%'
-GROUP BY subject_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS customers_mv IN CLUSTER compute AS
-SELECT
-    subject_id AS customer_id,
-    MAX(CASE WHEN predicate = 'customer_name' THEN object_value END) AS customer_name,
-    MAX(CASE WHEN predicate = 'customer_email' THEN object_value END) AS customer_email,
-    MAX(CASE WHEN predicate = 'customer_address' THEN object_value END) AS customer_address,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'customer:%'
-GROUP BY subject_id;"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS products_mv IN CLUSTER compute AS
-SELECT
-    subject_id AS product_id,
-    MAX(CASE WHEN predicate = 'product_name' THEN object_value END) AS product_name,
-    MAX(CASE WHEN predicate = 'category' THEN object_value END) AS category,
-    MAX(CASE WHEN predicate = 'unit_price' THEN object_value END)::DECIMAL(10,2) AS unit_price,
-    MAX(CASE WHEN predicate = 'perishable' THEN object_value END)::BOOLEAN AS perishable,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'product:%'
-GROUP BY subject_id;"
-
-echo "Creating dynamic pricing view with market basket and time-of-day analysis..."
-
-# Dynamic pricing view - regular view with 9 pricing factors including
-# market basket analysis (O(n²) self-join) and time-of-day demand patterns
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS inventory_items_with_dynamic_pricing AS
-WITH
-  -- Get order lines from delivered orders with timestamps
-  delivered_order_lines AS (
-    SELECT
-      ol.line_id,
-      ol.order_id,
-      ol.product_id,
-      ol.category,
-      ol.unit_price,
-      ol.quantity,
-      ol.perishable_flag,
-      o.order_status,
-      o.delivery_window_start,
-      ol.effective_updated_at
-    FROM order_lines_flat_mv ol
-    JOIN orders_flat_mv o ON o.order_id = ol.order_id
-    WHERE o.order_status = 'DELIVERED'
-  ),
-
-  -- ==========================================================================
-  -- MARKET BASKET ANALYSIS (Expensive O(n²) self-join)
-  -- Find products frequently bought together to enable anchor pricing strategy
-  -- ==========================================================================
-  product_pairs AS (
-    -- Self-join order lines to find co-purchased products (expensive!)
-    SELECT
-      ol1.product_id AS product_a,
-      ol2.product_id AS product_b,
-      ol1.order_id
-    FROM order_lines_flat_mv ol1
-    JOIN order_lines_flat_mv ol2
-      ON ol1.order_id = ol2.order_id
-      AND ol1.product_id < ol2.product_id
-  ),
-
-  cross_sell_affinity AS (
-    -- Calculate affinity scores for each product pair
-    SELECT
-      product_a,
-      product_b,
-      COUNT(*) AS co_purchase_count,
-      COUNT(*)::numeric / NULLIF(
-        (SELECT COUNT(DISTINCT order_id) FROM order_lines_flat_mv WHERE product_id = product_a), 0
-      ) AS affinity_score_a,
-      COUNT(*)::numeric / NULLIF(
-        (SELECT COUNT(DISTINCT order_id) FROM order_lines_flat_mv WHERE product_id = product_b), 0
-      ) AS affinity_score_b
-    FROM product_pairs
-    GROUP BY product_a, product_b
-    HAVING COUNT(*) >= 2
-  ),
-
-  basket_metrics AS (
-    SELECT
-      product_id,
-      COUNT(*) AS num_affinity_products,
-      AVG(affinity_score) AS avg_affinity_score,
-      MAX(co_purchase_count) AS max_copurchase_count,
-      CASE
-        WHEN COUNT(*) >= 5 AND AVG(affinity_score) > 0.3 THEN TRUE
-        ELSE FALSE
-      END AS is_basket_driver
-    FROM (
-      SELECT product_a AS product_id, affinity_score_a AS affinity_score, co_purchase_count
-      FROM cross_sell_affinity
-      UNION ALL
-      SELECT product_b AS product_id, affinity_score_b AS affinity_score, co_purchase_count
-      FROM cross_sell_affinity
-    ) all_affinities
-    GROUP BY product_id
-  ),
-
-  -- Note: TIME-OF-DAY DEMAND PATTERNS are NOT included in Materialize
-  -- because NOW() cannot be used in materialized views (mz_now() only works in WHERE/HAVING)
-  -- PostgreSQL views include time-of-day pricing; Materialize uses 8 factors instead of 9
-
-  -- Sales velocity
-  sales_velocity AS (
-    SELECT
-      product_id,
-      SUM(quantity) FILTER (WHERE rn <= 5) AS recent_sales,
-      SUM(quantity) FILTER (WHERE rn > 5 AND rn <= 15) AS prior_sales,
-      SUM(quantity) AS total_sales
-    FROM (
-      SELECT
-        product_id,
-        quantity,
-        ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY effective_updated_at DESC) AS rn
-      FROM delivered_order_lines
-    ) ranked_sales
-    WHERE rn <= 15
-    GROUP BY product_id
-  ),
-
-  popularity_score AS (
-    SELECT
-      product_id,
-      category,
-      SUM(quantity) AS sale_count,
-      RANK() OVER (PARTITION BY category ORDER BY SUM(quantity) DESC) AS popularity_rank
-    FROM delivered_order_lines
-    GROUP BY product_id, category
-  ),
-
-  inventory_status AS (
-    SELECT
-      product_id,
-      SUM(stock_level) AS total_stock,
-      RANK() OVER (ORDER BY SUM(stock_level) ASC) AS scarcity_rank
-    FROM store_inventory_mv
-    GROUP BY product_id
-  ),
-
-  high_demand_products AS (
-    SELECT
-      product_id,
-      sale_count,
-      CASE
-        WHEN sale_count > (SELECT AVG(sale_count) FROM popularity_score) THEN TRUE
-        ELSE FALSE
-      END AS is_high_demand
-    FROM popularity_score
-  ),
-
-  pricing_factors AS (
-    SELECT
-      ps.product_id,
-      ps.category,
-      ps.sale_count,
-      ps.popularity_rank,
-      CASE
-        WHEN ps.popularity_rank <= 3 THEN 1.20
-        WHEN ps.popularity_rank BETWEEN 4 AND 10 THEN 1.10
-        ELSE 0.90
-      END AS popularity_adjustment,
-      CASE
-        WHEN inv.scarcity_rank <= 3 THEN 1.15
-        WHEN inv.scarcity_rank BETWEEN 4 AND 10 THEN 1.08
-        WHEN inv.scarcity_rank BETWEEN 11 AND 20 THEN 1.00
-        ELSE 0.95
-      END AS scarcity_adjustment,
-      CASE
-        WHEN sv.prior_sales > 0 THEN
-          LEAST(GREATEST(
-            1.0 + ((sv.recent_sales::numeric / sv.prior_sales) - 1.0) * 0.25,
-            0.85
-          ), 1.25)
-        WHEN sv.recent_sales > 0 THEN 1.10
-        ELSE 1.0
-      END AS demand_multiplier,
-      CASE WHEN hd.is_high_demand THEN 1.05 ELSE 1.0 END AS demand_premium,
-      -- MARKET BASKET ADJUSTMENT
-      CASE
-        WHEN bm.is_basket_driver THEN 0.95
-        WHEN bm.num_affinity_products >= 3 THEN 0.98
-        ELSE 1.0
-      END AS basket_adjustment,
-      inv.total_stock,
-      sv.recent_sales,
-      sv.prior_sales,
-      sv.total_sales,
-      bm.num_affinity_products,
-      bm.is_basket_driver
-    FROM popularity_score ps
-    LEFT JOIN inventory_status inv ON inv.product_id = ps.product_id
-    LEFT JOIN sales_velocity sv ON sv.product_id = ps.product_id
-    LEFT JOIN high_demand_products hd ON hd.product_id = ps.product_id
-    LEFT JOIN basket_metrics bm ON bm.product_id = ps.product_id
-  )
-
-SELECT
-  inv.inventory_id,
-  inv.store_id,
-  inv.store_name,
-  inv.store_zone,
-  inv.product_id,
-  inv.product_name,
-  inv.category,
-  inv.stock_level,
-  inv.reserved_quantity,
-  inv.available_quantity,
-  inv.perishable,
-  inv.unit_price AS base_price,
-  CASE
-    WHEN inv.store_zone = 'MAN' THEN 1.15
-    WHEN inv.store_zone = 'BK' THEN 1.05
-    WHEN inv.store_zone = 'QNS' THEN 1.00
-    WHEN inv.store_zone = 'BX' THEN 0.98
-    WHEN inv.store_zone = 'SI' THEN 0.95
-    ELSE 1.00
-  END AS zone_adjustment,
-  CASE
-    WHEN inv.perishable = TRUE THEN 0.95
-    ELSE 1.0
-  END AS perishable_adjustment,
-  CASE
-    WHEN inv.available_quantity <= 5 THEN 1.10
-    WHEN inv.available_quantity <= 15 THEN 1.03
-    ELSE 1.0
-  END AS local_stock_adjustment,
-  pf.popularity_adjustment,
-  pf.scarcity_adjustment,
-  pf.demand_multiplier,
-  pf.demand_premium,
-  pf.basket_adjustment,
-  pf.sale_count AS product_sale_count,
-  pf.total_stock AS product_total_stock,
-  -- Computed dynamic price with 8 factors (time-of-day excluded for Materialize)
-  ROUND(
-    (COALESCE(inv.unit_price, 0) *
-    CASE WHEN inv.store_zone = 'MAN' THEN 1.15
-         WHEN inv.store_zone = 'BK' THEN 1.05
-         WHEN inv.store_zone = 'QNS' THEN 1.00
-         WHEN inv.store_zone = 'BX' THEN 0.98
-         WHEN inv.store_zone = 'SI' THEN 0.95
-         ELSE 1.00 END *
-    CASE WHEN inv.perishable = TRUE THEN 0.95 ELSE 1.0 END *
-    CASE WHEN inv.available_quantity <= 5 THEN 1.10
-         WHEN inv.available_quantity <= 15 THEN 1.03
-         ELSE 1.0 END *
-    COALESCE(pf.popularity_adjustment, 1.0) *
-    COALESCE(pf.scarcity_adjustment, 1.0) *
-    COALESCE(pf.demand_multiplier, 1.0) *
-    COALESCE(pf.demand_premium, 1.0) *
-    COALESCE(pf.basket_adjustment, 1.0))::numeric,
-    2
-  ) AS live_price,
-  ROUND(
-    ((COALESCE(inv.unit_price, 0) *
-      CASE WHEN inv.store_zone = 'MAN' THEN 1.15
-           WHEN inv.store_zone = 'BK' THEN 1.05
-           WHEN inv.store_zone = 'QNS' THEN 1.00
-           WHEN inv.store_zone = 'BX' THEN 0.98
-           WHEN inv.store_zone = 'SI' THEN 0.95
-           ELSE 1.00 END *
-      CASE WHEN inv.perishable = TRUE THEN 0.95 ELSE 1.0 END *
-      CASE WHEN inv.available_quantity <= 5 THEN 1.10
-           WHEN inv.available_quantity <= 15 THEN 1.03
-           ELSE 1.0 END *
-      COALESCE(pf.popularity_adjustment, 1.0) *
-      COALESCE(pf.scarcity_adjustment, 1.0) *
-      COALESCE(pf.demand_multiplier, 1.0) *
-      COALESCE(pf.demand_premium, 1.0) *
-      COALESCE(pf.basket_adjustment, 1.0)
-    ) - COALESCE(inv.unit_price, 0))::numeric,
-    2
-  ) AS price_change,
-  inv.effective_updated_at
-FROM store_inventory_mv inv
-LEFT JOIN pricing_factors pf ON pf.product_id = inv.product_id
-WHERE inv.unit_price IS NOT NULL;"
-
-echo "Creating dynamic pricing materialized view and indexes..."
-
-# Materialize the dynamic pricing view
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS inventory_items_with_dynamic_pricing_mv
-IN CLUSTER compute AS
-SELECT * FROM inventory_items_with_dynamic_pricing;"
-
-# Orders with aggregated line items, search fields, and live pricing (joins inventory MV above)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS orders_with_lines_mv IN CLUSTER compute AS
-SELECT
-    o.order_id,
-    o.order_number,
-    o.order_status,
-    o.store_id,
-    o.customer_id,
-    o.delivery_window_start,
-    o.delivery_window_end,
-    o.order_created_at,
-    o.order_total_amount,
-    -- Customer fields for search
-    c.customer_name,
-    c.customer_email,
-    c.customer_address,
-    -- Store fields for search
-    s.store_name,
-    s.store_zone,
-    s.store_address,
-    -- Delivery task fields for search
-    dt.assigned_courier_id,
-    dt.task_status AS delivery_task_status,
-    dt.eta AS delivery_eta,
-    -- Line items with dynamic pricing from inventory
-    COALESCE(
-        jsonb_agg(
-            jsonb_build_object(
-                'line_id', ol.line_id,
-                'product_id', ol.product_id,
-                'product_name', ol.product_name,
-                'category', ol.category,
-                'quantity', ol.quantity,
-                'unit_price', ol.unit_price,
-                'line_amount', ol.line_amount,
-                'line_sequence', ol.line_sequence,
-                'perishable_flag', ol.perishable_flag,
-                'unit_weight_grams', ol.unit_weight_grams,
-                -- Dynamic pricing (null if no inventory record for this product+store)
-                'inventory_id', ip.inventory_id,
-                'base_price', ip.base_price,
-                'live_price', ip.live_price,
-                'price_change', ip.price_change,
-                'zone_adjustment', ip.zone_adjustment,
-                'perishable_adjustment', ip.perishable_adjustment,
-                'local_stock_adjustment', ip.local_stock_adjustment,
-                'popularity_adjustment', ip.popularity_adjustment,
-                'scarcity_adjustment', ip.scarcity_adjustment,
-                'demand_multiplier', ip.demand_multiplier,
-                'demand_premium', ip.demand_premium,
-                'current_stock', ip.available_quantity
-            ) ORDER BY ol.line_sequence
-        ) FILTER (WHERE ol.line_id IS NOT NULL),
-        '[]'::jsonb
-    ) AS line_items,
-    -- Canonical text representation of the order's line items. This is the
-    -- exact input the embedding model sees. We expose the raw text (not an
-    -- md5 hash as before) because the perfect-embeddings SMT diffs this column
-    -- between the Debezium before/after image to decide whether to re-embed:
-    -- if embedding_text is unchanged (e.g. a price-only edit) the SMT skips the
-    -- embeddings call and the existing vector is preserved in OpenSearch.
-    COALESCE(
-        string_agg(
-            ol.product_name || ' (' || COALESCE(ol.category, '') || ')',
-            ' | '
-            ORDER BY ol.line_sequence
-        ) FILTER (WHERE ol.product_name IS NOT NULL AND ol.product_name <> ''),
-        ''
-    ) AS embedding_text,
-    COUNT(ol.line_id) AS line_item_count,
-    SUM(ol.line_amount) AS computed_total,
-    BOOL_OR(ol.perishable_flag) AS has_perishable_items,
-    SUM(ol.quantity * COALESCE(ol.unit_weight_grams, 0)::DECIMAL / 1000.0) AS total_weight_kg,
-    GREATEST(
-        o.effective_updated_at,
-        MAX(ol.effective_updated_at),
-        c.effective_updated_at,
-        s.effective_updated_at,
-        dt.effective_updated_at,
-        MAX(ip.effective_updated_at)
-    ) AS effective_updated_at
-FROM orders_flat_mv o
-LEFT JOIN customers_flat c ON c.customer_id = o.customer_id
-LEFT JOIN stores_flat s ON s.store_id = o.store_id
-LEFT JOIN delivery_tasks_flat dt ON dt.order_id = o.order_id
-LEFT JOIN order_lines_flat_mv ol ON ol.order_id = o.order_id
-LEFT JOIN inventory_items_with_dynamic_pricing_mv ip
-    ON ip.product_id = ol.product_id AND ip.store_id = o.store_id
-GROUP BY
-    o.order_id,
-    o.order_number,
-    o.order_status,
-    o.store_id,
-    o.customer_id,
-    o.delivery_window_start,
-    o.delivery_window_end,
-    o.order_created_at,
-    o.order_total_amount,
-    o.effective_updated_at,
-    c.customer_name,
-    c.customer_email,
-    c.customer_address,
-    c.effective_updated_at,
-    s.store_name,
-    s.store_zone,
-    s.store_address,
-    s.effective_updated_at,
-    dt.assigned_courier_id,
-    dt.task_status,
-    dt.eta,
-    dt.effective_updated_at;"
-echo "Creating indexes IN CLUSTER serving on materialized views..."
-
-# Create indexes in serving cluster on materialized views
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_flat_idx IN CLUSTER serving ON orders_flat_mv (order_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS store_inventory_idx IN CLUSTER serving ON store_inventory_mv (inventory_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_search_source_idx IN CLUSTER serving ON orders_search_source_mv (order_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS courier_schedule_idx IN CLUSTER serving ON courier_schedule_mv (courier_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS stores_idx IN CLUSTER serving ON stores_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS customers_idx IN CLUSTER serving ON customers_mv (customer_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS products_idx IN CLUSTER serving ON products_mv (product_id);"
-
-# Order line indexes
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS order_lines_order_id_idx IN CLUSTER serving ON order_lines_flat_mv (order_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS order_lines_product_id_idx IN CLUSTER serving ON order_lines_flat_mv (product_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS order_lines_order_sequence_idx IN CLUSTER serving ON order_lines_flat_mv (order_id, line_sequence);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_with_lines_idx IN CLUSTER serving ON orders_with_lines_mv (effective_updated_at DESC);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_with_lines_status_idx IN CLUSTER serving ON orders_with_lines_mv (order_status);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_with_lines_order_id_idx IN CLUSTER serving ON orders_with_lines_mv (order_id);"
-
-# Dynamic pricing indexes
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_dynamic_pricing_idx IN CLUSTER serving ON inventory_items_with_dynamic_pricing_mv (inventory_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_dynamic_pricing_product_idx IN CLUSTER serving ON inventory_items_with_dynamic_pricing_mv (product_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_dynamic_pricing_store_idx IN CLUSTER serving ON inventory_items_with_dynamic_pricing_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_dynamic_pricing_zone_idx IN CLUSTER serving ON inventory_items_with_dynamic_pricing_mv (store_zone);"
-# Composite (store_id, product_id) index. Without it, the api's per-order
-# pricing join falls back to a full-scan of this MV (~7.6k rows × peek QPS),
-# inflating reaction-time p99 by ~5x. With it, the join becomes a
-# differential join over the existing arrangement.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_pricing_store_product_idx IN CLUSTER serving ON inventory_items_with_dynamic_pricing_mv (store_id, product_id);"
-
-# Pre-computes the per-order × line-items × pricing join the api needs.
-# Backed by orders_enriched_v_order_id_idx so SELECT * FROM orders_enriched_v
-# WHERE order_id = ... resolves to a single (lookup) operation in EXPLAIN —
-# no per-query CTE expansion, no per-query join, no GROUP BY at peek time.
+# The hero view: one row per active package with everything a copilot
+# needs to answer "where is it and why is it at risk?"
 #
-# Shape note: LATERAL jsonb_array_elements and the LEFT JOIN are kept at the
-# *same* FROM level. An earlier CTE-based draft that wrapped the LATERAL in a
-# CTE and LEFT-JOINed against it from an outer subquery triggered an MZ
-# planner internal error ("column 0 is not of expected type ... String ...:
-# TimestampTz") on this same view. See MZ-BUG-internal-error-column0.md.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS orders_enriched_v AS
-SELECT
-    o.order_id, o.order_number, o.order_status, o.store_id, o.customer_id,
-    o.delivery_window_start, o.delivery_window_end, o.order_created_at, o.order_total_amount,
-    o.customer_name, o.customer_email, o.customer_address,
-    o.store_name, o.store_zone, o.store_address,
-    o.assigned_courier_id, o.delivery_task_status, o.delivery_eta,
-    o.line_item_count, o.computed_total, o.has_perishable_items, o.total_weight_kg,
-    GREATEST(o.effective_updated_at, MAX(p.effective_updated_at)) AS effective_updated_at,
-    jsonb_agg(
-        jsonb_build_object(
-            'line_id',         li.value->>'line_id',
-            'product_id',      li.value->>'product_id',
-            'product_name',    li.value->>'product_name',
-            'category',        li.value->>'category',
-            'quantity',        (li.value->>'quantity')::int,
-            'unit_price',      (li.value->>'unit_price')::numeric,
-            'line_amount',     (li.value->>'line_amount')::numeric,
-            'line_sequence',   (li.value->>'line_sequence')::int,
-            'perishable_flag', (li.value->>'perishable_flag')::boolean,
-            'live_price',      p.live_price,
-            'base_price',      p.base_price,
-            'price_change',    p.price_change,
-            'current_stock',   p.stock_level
-        )
-        ORDER BY (li.value->>'line_sequence')::int
-    ) AS line_items
-FROM orders_with_lines_mv o,
-     LATERAL jsonb_array_elements(o.line_items) AS li(value)
-LEFT JOIN inventory_items_with_dynamic_pricing_mv p
-       ON p.product_id = li.value->>'product_id'
-      AND p.store_id   = o.store_id
-GROUP BY
-    o.order_id, o.order_number, o.order_status, o.store_id, o.customer_id,
-    o.delivery_window_start, o.delivery_window_end, o.order_created_at, o.order_total_amount,
-    o.customer_name, o.customer_email, o.customer_address,
-    o.store_name, o.store_zone, o.store_address,
-    o.assigned_courier_id, o.delivery_task_status, o.delivery_eta,
-    o.line_item_count, o.computed_total, o.has_perishable_items, o.total_weight_kg,
-    o.effective_updated_at;
-"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_enriched_v_order_id_idx IN CLUSTER serving ON orders_enriched_v (order_id);"
-
-echo "Creating CEO metrics materialized views..."
-
-# 1. Pricing Yield MV - tracks revenue premium from dynamic pricing
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS pricing_yield_mv IN CLUSTER compute AS
-SELECT
-    ol.line_id,
-    ol.order_id,
-    o.store_id,
-    s.store_zone,
-    ol.product_id,
-    ol.category,
-    ol.quantity,
-    ol.unit_price AS order_price,
-    ol.current_product_price AS base_price,
-    (ol.unit_price - ol.current_product_price) * ol.quantity AS price_premium,
-    o.order_status,
-    o.effective_updated_at
-FROM order_lines_flat_mv ol
-JOIN orders_flat_mv o ON o.order_id = ol.order_id
-JOIN stores_flat s ON s.store_id = o.store_id
-WHERE o.order_status = 'DELIVERED'
-  AND ol.current_product_price IS NOT NULL;"
-
-# 2. Inventory Risk MV - identifies products at risk of stockout with revenue impact
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS inventory_risk_mv IN CLUSTER compute AS
-WITH pending_reservations AS (
+# The equipment that matters is the *planned sorter* while the package is
+# still upstream of sortation (a jam there strands it), and the last
+# scanned equipment afterwards.
+run "CREATE MATERIALIZED VIEW package_context_mv IN CLUSTER compute AS
+WITH pkg AS (
     SELECT
-        o.store_id,
-        ol.product_id,
-        SUM(ol.quantity) AS pending_qty,
-        SUM(ol.line_amount) AS pending_value
-    FROM order_lines_flat_mv ol
-    JOIN orders_flat_mv o ON o.order_id = ol.order_id
-    WHERE o.order_status IN ('CREATED', 'PICKING', 'OUT_FOR_DELIVERY')
-    GROUP BY o.store_id, ol.product_id
+        p.*,
+        ls.ts AS last_scan_ts,
+        ls.scan_type AS last_scan_type,
+        ls.equipment_id AS last_scan_equipment_id,
+        CASE
+            WHEN p.status IN ('CREATED', 'ARRIVED_ORIGIN', 'INDUCTED')
+                THEN p.planned_sort_equipment_id
+            ELSE ls.equipment_id
+        END AS relevant_equipment_id
+    FROM packages p
+    LEFT JOIN latest_package_scan ls ON ls.package_id = p.package_id
+    WHERE p.status NOT IN ('DELIVERED', 'CANCELLED')
 )
 SELECT
-    inv.inventory_id,
-    inv.store_id,
-    inv.store_name,
-    inv.store_zone,
-    inv.product_id,
-    inv.product_name,
-    inv.category,
-    inv.stock_level,
-    COALESCE(pr.pending_qty, 0)::INT AS pending_reservations,
-    COALESCE(pr.pending_value, 0) AS revenue_at_risk,
-    inv.perishable,
+    p.package_id,
+    p.service_level,
+    p.status,
+    p.promised_delivery,
+    p.origin_facility_id,
+    p.dest_facility_id,
+    p.current_facility_id,
+    f.name AS current_facility_name,
+    p.last_scan_ts,
+    p.last_scan_type,
+    p.planned_sort_equipment_id,
+    p.relevant_equipment_id AS equipment_id,
+    e.name AS equipment_name,
+    e.status AS equipment_status,
+    COALESCE(ea.active_alarm_count, 0) AS equipment_alarm_count,
+    CASE ea.severity_rank WHEN 3 THEN 'CRITICAL' WHEN 2 THEN 'WARNING' WHEN 1 THEN 'INFO' END
+        AS equipment_alarm_severity,
+    laa.message AS equipment_alarm_message,
+    p.assigned_trailer_id AS trailer_id,
+    t.status AS trailer_status,
+    t.door AS trailer_door,
+    t.scheduled_departure AS trailer_scheduled_departure,
+    t.tractor_vehicle_id AS tractor_id,
+    COALESCE(vf.active_fault_count, 0) AS tractor_fault_count,
+    CASE vf.severity_rank WHEN 3 THEN 'CRITICAL' WHEN 2 THEN 'WARNING' WHEN 1 THEN 'INFO' END
+        AS tractor_fault_severity,
+    vf.fault_codes AS tractor_fault_codes,
+    (COALESCE(ea.active_alarm_count, 0) > 0
+        AND p.status IN ('CREATED', 'ARRIVED_ORIGIN', 'INDUCTED')) AS equipment_at_risk,
+    (COALESCE(vf.critical_fault_count, 0) > 0) AS tractor_at_risk,
     CASE
-        WHEN GREATEST(inv.stock_level - COALESCE(pr.pending_qty, 0), 0) <= 0 THEN 'CRITICAL'
-        WHEN GREATEST(inv.stock_level - COALESCE(pr.pending_qty, 0), 0) <= 5 THEN 'HIGH'
-        WHEN GREATEST(inv.stock_level - COALESCE(pr.pending_qty, 0), 0) <= 10 THEN 'MEDIUM'
+        WHEN (ea.severity_rank = 3 AND p.status IN ('CREATED', 'ARRIVED_ORIGIN', 'INDUCTED'))
+            OR vf.severity_rank = 3 THEN 'HIGH'
+        WHEN (COALESCE(ea.active_alarm_count, 0) > 0
+                AND p.status IN ('CREATED', 'ARRIVED_ORIGIN', 'INDUCTED'))
+            OR COALESCE(vf.active_fault_count, 0) > 0 THEN 'MEDIUM'
         ELSE 'LOW'
-    END AS risk_level,
-    CASE WHEN inv.perishable
-        THEN COALESCE(pr.pending_value, 0) * 2
-        ELSE COALESCE(pr.pending_value, 0)
-    END AS risk_weighted_value,
-    inv.effective_updated_at
-FROM store_inventory_mv inv
-LEFT JOIN pending_reservations pr
-    ON pr.store_id = inv.store_id AND pr.product_id = inv.product_id
-WHERE inv.unit_price IS NOT NULL;"
+    END AS risk_level
+FROM pkg p
+LEFT JOIN facilities f ON f.facility_id = p.current_facility_id
+LEFT JOIN equipment e ON e.equipment_id = p.relevant_equipment_id
+LEFT JOIN equipment_alarm_agg ea ON ea.equipment_id = p.relevant_equipment_id
+LEFT JOIN latest_active_alarm laa ON laa.equipment_id = p.relevant_equipment_id
+LEFT JOIN trailers t ON t.trailer_id = p.assigned_trailer_id
+LEFT JOIN vehicle_fault_agg vf ON vf.vehicle_id = t.tractor_vehicle_id;"
 
-# 3. Store Capacity Health MV - monitors store utilization and capacity constraints
-#
-# CAPACITY MODEL EXPLANATION:
-# - Hourly capacity (store_capacity_orders_per_hour): Number of new orders a store can accept per hour
-# - Concurrent capacity: Total number of orders a store can handle simultaneously
-#   Formula: hourly_rate × average_fulfillment_time
-#
-# The 4-hour multiplier represents the average fulfillment time for same-day delivery:
-#   - Order placed → Picking (1-2 hours) → Packing (30 min) → Delivery (1-2 hours)
-#   - This allows orders to arrive continuously while previous orders are still being fulfilled
-#
-# Example: A store with 10 orders/hour capacity can handle 40 concurrent orders
-#   - New orders arrive at 10/hour
-#   - Each order takes ~4 hours to complete
-#   - At steady state: 40 orders in various stages of fulfillment
-#
-# Utilization is calculated as: active_orders / concurrent_capacity
-# This gives a more accurate view of store workload than comparing to hourly intake rate alone.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS store_capacity_health_mv IN CLUSTER compute AS
-WITH active_workload AS (
-    SELECT
-        store_id,
-        COUNT(*) AS active_orders,
-        SUM(order_total_amount) AS active_value
-    FROM orders_flat_mv
-    WHERE order_status IN ('CREATED', 'PICKING', 'OUT_FOR_DELIVERY')
-    GROUP BY store_id
+# Per-facility health rollup for the dashboard and the copilot.
+run "CREATE MATERIALIZED VIEW hub_health_mv IN CLUSTER compute AS
+WITH scans_10m AS (
+    SELECT facility_id, COUNT(*) AS scans_last_10m
+    FROM scan_events
+    WHERE mz_now() <= ts + INTERVAL '10 minutes'
+    GROUP BY facility_id
 ),
-store_with_capacity AS (
+alarm_rollup AS (
     SELECT
-        s.store_id,
-        s.store_name,
-        s.store_zone,
-        s.store_capacity_orders_per_hour,
-        -- Concurrent capacity = hourly rate × 4 hours avg fulfillment time
-        -- See comment block above for detailed explanation
-        s.store_capacity_orders_per_hour * 4 AS concurrent_capacity,
-        COALESCE(aw.active_orders, 0) AS active_orders,
-        s.effective_updated_at
-    FROM stores_mv s
-    LEFT JOIN active_workload aw ON aw.store_id = s.store_id
+        e.facility_id,
+        COUNT(*) AS active_alarms,
+        COUNT(*) FILTER (WHERE a.severity = 'CRITICAL') AS critical_alarms
+    FROM alarms a
+    JOIN equipment e ON e.equipment_id = a.equipment_id
+    WHERE a.cleared_at IS NULL
+    GROUP BY e.facility_id
+),
+equip_rollup AS (
+    SELECT
+        facility_id,
+        COUNT(*) AS equipment_total,
+        COUNT(*) FILTER (WHERE status = 'DOWN') AS equipment_down,
+        COUNT(*) FILTER (WHERE status = 'DEGRADED') AS equipment_degraded
+    FROM equipment
+    GROUP BY facility_id
+),
+sorter_throughput AS (
+    SELECT e.facility_id, AVG(s.avg_value) AS avg_sorter_throughput_pph
+    FROM equipment_tag_stats_5m s
+    JOIN equipment e ON e.equipment_id = s.equipment_id
+    WHERE s.tag_name = 'throughput_pph' AND e.equipment_type = 'SORTER'
+    GROUP BY e.facility_id
 )
 SELECT
-    store_id,
-    store_name,
-    store_zone,
-    store_capacity_orders_per_hour,
-    active_orders AS current_active_orders,
-    ROUND((active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) * 100, 1) AS current_utilization_pct,
-    concurrent_capacity - active_orders AS headroom,
+    f.facility_id,
+    f.name,
+    f.city,
+    f.state,
+    COALESCE(s.scans_last_10m, 0) AS scans_last_10m,
+    COALESCE(a.active_alarms, 0) AS active_alarms,
+    COALESCE(a.critical_alarms, 0) AS critical_alarms,
+    eq.equipment_total,
+    COALESCE(eq.equipment_down, 0) AS equipment_down,
+    COALESCE(eq.equipment_degraded, 0) AS equipment_degraded,
+    st.avg_sorter_throughput_pph,
     CASE
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) >= 0.90 THEN 'CRITICAL'
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) >= 0.70 THEN 'STRAINED'
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) >= 0.40 THEN 'HEALTHY'
-        ELSE 'UNDERUTILIZED'
-    END AS health_status,
-    CASE
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) >= 0.90 THEN 'CLOSE_INTAKE'
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) >= 0.70 THEN 'SURGE_PRICING'
-        WHEN (active_orders::DECIMAL / NULLIF(concurrent_capacity, 0)) < 0.40 THEN 'PROMOTE_DEMAND'
-        ELSE 'MONITOR'
-    END AS recommended_action,
-    effective_updated_at
-FROM store_with_capacity;"
+        WHEN COALESCE(a.critical_alarms, 0) > 0 OR COALESCE(eq.equipment_down, 0) > 0 THEN 'CRITICAL'
+        WHEN COALESCE(a.active_alarms, 0) > 0 OR COALESCE(eq.equipment_degraded, 0) > 0 THEN 'DEGRADED'
+        ELSE 'HEALTHY'
+    END AS health_status
+FROM facilities f
+LEFT JOIN scans_10m s ON s.facility_id = f.facility_id
+LEFT JOIN alarm_rollup a ON a.facility_id = f.facility_id
+LEFT JOIN equip_rollup eq ON eq.facility_id = f.facility_id
+LEFT JOIN sorter_throughput st ON st.facility_id = f.facility_id;"
 
-echo "Creating indexes for CEO metrics..."
-
-# Pricing yield indexes
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS pricing_yield_zone_idx IN CLUSTER serving ON pricing_yield_mv (store_zone, category);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS pricing_yield_store_idx IN CLUSTER serving ON pricing_yield_mv (store_id);"
-
-# Inventory risk indexes
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_risk_level_idx IN CLUSTER serving ON inventory_risk_mv (risk_level, store_zone);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_risk_store_idx IN CLUSTER serving ON inventory_risk_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS inventory_risk_category_idx IN CLUSTER serving ON inventory_risk_mv (category);"
-
-# Store capacity health indexes
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS store_capacity_health_idx IN CLUSTER serving ON store_capacity_health_mv (health_status, store_zone);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS store_capacity_store_idx IN CLUSTER serving ON store_capacity_health_mv (store_id);"
-
-# =============================================================================
-# COURIER DISPATCH VIEWS
-# These views support the courier-driven order fulfillment system where:
-# - Couriers handle both picking (2 min) and delivery (2 min)
-# - Orders queue up if no couriers are available
-# - Materialize incrementally maintains all courier/order state
-# =============================================================================
-
-echo "Creating courier dispatch views..."
-
-# View 1: Available couriers per store
-# Couriers who are AVAILABLE and not currently assigned to an active task
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS couriers_available AS
-SELECT
-    cf.courier_id,
-    cf.courier_name,
-    cf.home_store_id,
-    cf.vehicle_type,
-    cf.courier_status,
-    cf.effective_updated_at
-FROM couriers_flat cf
-WHERE cf.courier_status = 'AVAILABLE'
-  AND NOT EXISTS (
-    SELECT 1 FROM delivery_tasks_flat dt
-    WHERE dt.assigned_courier_id = cf.courier_id
-      AND dt.task_status IN ('PICKING', 'DELIVERING')
-  );"
-
-# View 2: Orders awaiting courier assignment
-# Orders in CREATED status that don't have an active delivery task
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS orders_awaiting_courier AS
-SELECT
-    o.order_id,
-    o.order_number,
-    o.store_id,
-    o.customer_id,
-    o.order_total_amount,
-    o.delivery_window_start,
-    o.delivery_window_end,
-    o.effective_updated_at AS created_at
-FROM orders_flat_mv o
-WHERE o.order_status = 'CREATED'
-  AND NOT EXISTS (
-    SELECT 1 FROM delivery_tasks_flat dt
-    WHERE dt.order_id = o.order_id
-      AND dt.task_status IN ('PICKING', 'DELIVERING')
-  );"
-
-# View 3: Active delivery tasks with timing info
-# Tasks currently being worked on, with expected completion time
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS delivery_tasks_active AS
-SELECT
-    dt.task_id,
-    dt.order_id,
-    dt.assigned_courier_id AS courier_id,
-    dt.task_status,
-    dt.task_started_at,
-    o.store_id,
-    o.customer_id,
-    cf.courier_name,
-    cf.vehicle_type,
-    -- Expected completion time: task_started_at + 5 seconds
-    dt.task_started_at + INTERVAL '5 seconds' AS expected_completion_at,
-    dt.effective_updated_at
-FROM delivery_tasks_flat dt
-JOIN orders_flat_mv o ON o.order_id = dt.order_id
-LEFT JOIN couriers_flat cf ON cf.courier_id = dt.assigned_courier_id
-WHERE dt.task_status IN ('PICKING', 'DELIVERING')
-  AND dt.task_started_at IS NOT NULL;"
-
-# View 4: Tasks ready to advance (timer elapsed)
-# Uses mz_now() for real-time filtering - tasks where 2 minutes have passed
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS tasks_ready_to_advance AS
-SELECT
-    task_id,
-    order_id,
-    courier_id,
-    task_status,
-    task_started_at,
-    store_id,
-    expected_completion_at
-FROM delivery_tasks_active
-WHERE expected_completion_at <= mz_now();"
-
-# Materialized View 5: Store courier metrics
-# Aggregated metrics per store for operational visibility
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS store_courier_metrics_mv IN CLUSTER compute AS
-WITH courier_counts AS (
-    SELECT
-        cf.home_store_id AS store_id,
-        COUNT(*) FILTER (WHERE cf.courier_status = 'AVAILABLE') AS available_couriers,
-        COUNT(*) FILTER (WHERE cf.courier_status IN ('PICKING', 'DELIVERING')) AS busy_couriers,
-        COUNT(*) FILTER (WHERE cf.courier_status = 'OFF_SHIFT') AS off_shift_couriers,
-        COUNT(*) AS total_couriers
-    FROM couriers_flat cf
-    GROUP BY cf.home_store_id
-),
-queue_counts AS (
-    SELECT
-        store_id,
-        COUNT(*) AS orders_in_queue
-    FROM orders_awaiting_courier
-    GROUP BY store_id
-),
-active_task_counts AS (
-    SELECT
-        store_id,
-        COUNT(*) FILTER (WHERE task_status = 'PICKING') AS orders_picking,
-        COUNT(*) FILTER (WHERE task_status = 'DELIVERING') AS orders_delivering
-    FROM delivery_tasks_active
-    GROUP BY store_id
+# Per-equipment live status: latest telemetry pivoted wide + alarm state.
+run "CREATE MATERIALIZED VIEW equipment_status_mv IN CLUSTER compute AS
+WITH latest_by_name AS (
+    SELECT t.equipment_id, t.tag_name, ltv.value, ltv.ts
+    FROM latest_tag_values ltv
+    JOIN tags t ON t.tag_id = ltv.tag_id
 )
 SELECT
-    s.store_id,
-    s.store_name,
-    s.store_zone,
-    COALESCE(cc.total_couriers, 0)::INT AS total_couriers,
-    COALESCE(cc.available_couriers, 0)::INT AS available_couriers,
-    COALESCE(cc.busy_couriers, 0)::INT AS busy_couriers,
-    COALESCE(cc.off_shift_couriers, 0)::INT AS off_shift_couriers,
-    COALESCE(qc.orders_in_queue, 0)::INT AS orders_in_queue,
-    COALESCE(atc.orders_picking, 0)::INT AS orders_picking,
-    COALESCE(atc.orders_delivering, 0)::INT AS orders_delivering,
-    -- Estimated wait time in minutes: (queue_depth / available_couriers) * 10 sec per order
-    -- 10 seconds = 5 sec picking + 5 sec delivery
+    e.equipment_id,
+    e.facility_id,
+    e.equipment_type,
+    e.name,
+    e.status,
+    MAX(CASE WHEN l.tag_name = 'belt_speed_fpm' THEN l.value END) AS belt_speed_fpm,
+    MAX(CASE WHEN l.tag_name = 'motor_temp_c' THEN l.value END) AS motor_temp_c,
+    MAX(CASE WHEN l.tag_name = 'vibration_mm_s' THEN l.value END) AS vibration_mm_s,
+    MAX(CASE WHEN l.tag_name = 'throughput_pph' THEN l.value END) AS throughput_pph,
+    MAX(CASE WHEN l.tag_name = 'read_rate_pct' THEN l.value END) AS read_rate_pct,
+    MAX(l.ts) AS latest_reading_ts,
+    COALESCE(MAX(ea.active_alarm_count), 0) AS active_alarm_count,
+    CASE MAX(ea.severity_rank) WHEN 3 THEN 'CRITICAL' WHEN 2 THEN 'WARNING' WHEN 1 THEN 'INFO' END
+        AS alarm_severity,
+    MAX(laa.message) AS latest_alarm_message
+FROM equipment e
+LEFT JOIN latest_by_name l ON l.equipment_id = e.equipment_id
+LEFT JOIN equipment_alarm_agg ea ON ea.equipment_id = e.equipment_id
+LEFT JOIN latest_active_alarm laa ON laa.equipment_id = e.equipment_id
+GROUP BY e.equipment_id, e.facility_id, e.equipment_type, e.name, e.status;"
+
+# Per-vehicle fleet risk: faults + what the vehicle is hauling right now.
+run "CREATE MATERIALIZED VIEW fleet_risk_mv IN CLUSTER compute AS
+WITH loaded AS (
+    SELECT assigned_trailer_id AS trailer_id, COUNT(*) AS loaded_package_count
+    FROM packages
+    WHERE status = 'LOADED' AND assigned_trailer_id IS NOT NULL
+    GROUP BY assigned_trailer_id
+)
+SELECT
+    v.vehicle_id,
+    v.vehicle_type,
+    v.home_facility_id,
+    v.status,
+    v.odometer_miles,
+    d.driver_id,
+    d.name AS driver_name,
+    COALESCE(vf.active_fault_count, 0) AS active_fault_count,
+    COALESCE(vf.critical_fault_count, 0) AS critical_fault_count,
+    CASE vf.severity_rank WHEN 3 THEN 'CRITICAL' WHEN 2 THEN 'WARNING' WHEN 1 THEN 'INFO' END
+        AS fault_severity,
+    vf.fault_codes,
+    COALESCE(owo.open_work_orders, 0) AS open_work_orders,
+    t.trailer_id AS attached_trailer_id,
+    t.status AS trailer_status,
+    t.route_id,
+    t.dest_facility_id AS trailer_dest_facility_id,
+    COALESCE(l.loaded_package_count, 0) AS loaded_package_count,
     CASE
-        WHEN COALESCE(cc.available_couriers, 0) = 0 AND COALESCE(qc.orders_in_queue, 0) > 0
-        THEN -1  -- Infinite wait (no couriers)
-        WHEN COALESCE(cc.available_couriers, 0) = 0
-        THEN 0   -- No queue, no couriers
-        ELSE ROUND((COALESCE(qc.orders_in_queue, 0)::DECIMAL / cc.available_couriers) * (10.0 / 60.0), 1)
-    END AS estimated_wait_minutes,
-    -- Courier utilization percentage
-    CASE
-        WHEN COALESCE(cc.total_couriers, 0) = 0 THEN 0
-        ELSE ROUND((COALESCE(cc.busy_couriers, 0)::DECIMAL / cc.total_couriers) * 100, 1)
-    END AS courier_utilization_pct,
-    s.effective_updated_at
-FROM stores_flat s
-LEFT JOIN courier_counts cc ON cc.store_id = s.store_id
-LEFT JOIN queue_counts qc ON qc.store_id = s.store_id
-LEFT JOIN active_task_counts atc ON atc.store_id = s.store_id;"
+        WHEN COALESCE(vf.critical_fault_count, 0) > 0 THEN 'HIGH'
+        WHEN COALESCE(vf.active_fault_count, 0) > 0 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS risk_level
+FROM vehicles v
+LEFT JOIN drivers d ON d.assigned_vehicle_id = v.vehicle_id
+LEFT JOIN vehicle_fault_agg vf ON vf.vehicle_id = v.vehicle_id
+LEFT JOIN open_work_orders_agg owo ON owo.vehicle_id = v.vehicle_id
+LEFT JOIN trailers t ON t.tractor_vehicle_id = v.vehicle_id
+LEFT JOIN loaded l ON l.trailer_id = t.trailer_id;"
 
-echo "Creating courier dispatch indexes..."
-
-# Indexes for courier dispatch views
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS couriers_available_store_idx IN CLUSTER serving ON couriers_flat (home_store_id, courier_status);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS store_courier_metrics_idx IN CLUSTER serving ON store_courier_metrics_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS store_courier_metrics_zone_idx IN CLUSTER serving ON store_courier_metrics_mv (store_zone);"
-
-# =============================================================================
-# TIME-SERIES VIEWS FOR SPARKLINES AND TREND ANALYSIS
-# Uses mz_now() temporal filters to maintain a rolling 30-minute window
-# =============================================================================
-
-echo "Creating time-series views for sparklines..."
-
-# Orders bucketed into 1-minute time windows (rolling 60-minute history)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS orders_time_bucketed AS
+# Per-minute scan counts for the dashboard throughput sparkline.
+run "CREATE MATERIALIZED VIEW hub_throughput_minute_mv IN CLUSTER compute AS
 SELECT
-    o.order_id,
-    o.store_id,
-    o.order_status,
-    o.order_created_at,
-    date_bin('1 minute', o.order_created_at, '2000-01-01 00:00:00+00'::timestamptz) + INTERVAL '1 minute' AS window_end
-FROM orders_flat_mv o
-WHERE o.order_created_at IS NOT NULL
-  AND mz_now() <= EXTRACT(EPOCH FROM o.order_created_at)::bigint * 1000 + 3600000;"
+    facility_id,
+    date_trunc('minute', ts) AS minute,
+    COUNT(*) AS scan_count
+FROM scan_events
+WHERE mz_now() <= ts + INTERVAL '15 minutes'
+GROUP BY facility_id, date_trunc('minute', ts);"
 
-# Store metrics aggregated by time window
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS store_metrics_by_window_mv IN CLUSTER compute AS
-SELECT
-    ob.store_id,
-    ob.window_end,
-    COUNT(*) FILTER (WHERE ob.order_status = 'CREATED') AS queue_depth,
-    COUNT(*) FILTER (WHERE ob.order_status IN ('PICKING', 'OUT_FOR_DELIVERY')) AS in_progress,
-    COUNT(*) AS total_orders
-FROM orders_time_bucketed ob
-WHERE mz_now() >= EXTRACT(EPOCH FROM ob.window_end)::bigint * 1000
-  AND mz_now() < EXTRACT(EPOCH FROM ob.window_end)::bigint * 1000 + 1800000
-GROUP BY ob.store_id, ob.window_end;"
+# Lateness cannot be a projected column (mz_now() is only legal in
+# WHERE/HAVING), so 'promise window approaching' is a filtered view.
+run "CREATE VIEW late_package_risk_v AS
+SELECT *
+FROM package_context_mv
+WHERE mz_now() >= promised_delivery - INTERVAL '4 hours';"
 
-# Delivery tasks flat with timestamps (intermediate view for wait time calculation)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS delivery_tasks_flat_with_timestamps AS
-SELECT
-    subject_id AS task_id,
-    MAX(CASE WHEN predicate = 'task_of_order' THEN object_value END) AS order_id,
-    MAX(CASE WHEN predicate = 'assigned_to' THEN object_value END) AS assigned_courier_id,
-    MAX(CASE WHEN predicate = 'task_status' THEN object_value END) AS task_status,
-    MAX(CASE WHEN predicate = 'task_started_at' THEN object_value END)::TIMESTAMPTZ AS task_started_at,
-    MAX(CASE WHEN predicate = 'task_completed_at' THEN object_value END)::TIMESTAMPTZ AS task_completed_at,
-    MAX(CASE WHEN predicate = 'eta' THEN object_value END) AS eta,
-    MAX(updated_at) AS effective_updated_at
-FROM triples
-WHERE subject_id LIKE 'task:%'
-GROUP BY subject_id;"
+# ============================================================
+# Serving indexes: what the API and copilot actually read.
+# ============================================================
+echo "Creating serving indexes..."
+run "CREATE INDEX package_context_package_id_idx IN CLUSTER serving ON package_context_mv (package_id);"
+run "CREATE INDEX package_context_risk_idx IN CLUSTER serving ON package_context_mv (risk_level);"
+run "CREATE INDEX late_package_risk_package_id_idx IN CLUSTER serving ON late_package_risk_v (package_id);"
+run "CREATE INDEX hub_health_facility_id_idx IN CLUSTER serving ON hub_health_mv (facility_id);"
+run "CREATE INDEX equipment_status_equipment_id_idx IN CLUSTER serving ON equipment_status_mv (equipment_id);"
+run "CREATE INDEX equipment_status_facility_id_idx IN CLUSTER serving ON equipment_status_mv (facility_id);"
+run "CREATE INDEX fleet_risk_vehicle_id_idx IN CLUSTER serving ON fleet_risk_mv (vehicle_id);"
+run "CREATE INDEX active_alarms_equipment_id_idx IN CLUSTER serving ON active_alarms (equipment_id);"
+run "CREATE INDEX hub_throughput_facility_id_idx IN CLUSTER serving ON hub_throughput_minute_mv (facility_id);"
 
-# Delivery task timestamps with wait time bucketing
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS wait_times_bucketed AS
-SELECT
-    dt.order_id,
-    o.store_id,
-    dt.task_started_at,
-    EXTRACT(EPOCH FROM (dt.task_started_at - o.order_created_at)) / 60.0 AS wait_minutes,
-    date_bin('1 minute', dt.task_started_at, '2000-01-01 00:00:00+00'::timestamptz) + INTERVAL '1 minute' AS window_end
-FROM delivery_tasks_flat_with_timestamps dt
-JOIN orders_flat_mv o ON dt.order_id = o.order_id
-WHERE dt.task_started_at IS NOT NULL
-  AND o.order_created_at IS NOT NULL
-  AND mz_now() <= EXTRACT(EPOCH FROM dt.task_started_at)::bigint * 1000 + 3600000;"
-
-# Store wait time metrics by time window
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS store_wait_time_by_window_mv IN CLUSTER compute AS
-SELECT
-    wb.store_id,
-    wb.window_end,
-    AVG(wb.wait_minutes)::numeric(10,2) AS avg_wait_minutes,
-    MAX(wb.wait_minutes)::numeric(10,2) AS max_wait_minutes,
-    COUNT(*) AS orders_picked_up
-FROM wait_times_bucketed wb
-WHERE mz_now() >= EXTRACT(EPOCH FROM wb.window_end)::bigint * 1000
-  AND mz_now() < EXTRACT(EPOCH FROM wb.window_end)::bigint * 1000 + 1800000
-GROUP BY wb.store_id, wb.window_end;"
-
-# Combined store metrics timeseries for UI consumption
-# ID is generated from store_id + window_end for Zero single-column PK requirement
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS store_metrics_timeseries_mv IN CLUSTER compute AS
-SELECT
-    COALESCE(sm.store_id, wt.store_id) || ':' || EXTRACT(EPOCH FROM COALESCE(sm.window_end, wt.window_end))::bigint::text AS id,
-    COALESCE(sm.store_id, wt.store_id) AS store_id,
-    EXTRACT(EPOCH FROM COALESCE(sm.window_end, wt.window_end))::bigint * 1000 AS window_end,
-    COALESCE(sm.queue_depth, 0) AS queue_depth,
-    COALESCE(sm.in_progress, 0) AS in_progress,
-    COALESCE(sm.total_orders, 0) AS total_orders,
-    wt.avg_wait_minutes,
-    wt.max_wait_minutes,
-    COALESCE(wt.orders_picked_up, 0) AS orders_picked_up
-FROM store_metrics_by_window_mv sm
-FULL JOIN store_wait_time_by_window_mv wt
-    ON sm.store_id = wt.store_id AND sm.window_end = wt.window_end;"
-
-# System-wide aggregate timeseries for executive dashboard
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS system_metrics_timeseries_mv IN CLUSTER compute AS
-SELECT
-    window_end::text AS id,
-    window_end,
-    SUM(queue_depth) AS total_queue_depth,
-    SUM(in_progress) AS total_in_progress,
-    SUM(total_orders) AS total_orders,
-    AVG(avg_wait_minutes)::numeric(10,2) AS avg_wait_minutes,
-    MAX(max_wait_minutes) AS max_wait_minutes,
-    SUM(orders_picked_up) AS total_orders_picked_up
-FROM store_metrics_timeseries_mv
-GROUP BY window_end;"
-
-# Current queue wait time - real-time wait for orders still waiting to be picked up
-# This uses mz_now() to calculate how long orders have been waiting
-# NOTE: These are VIEWs (not materialized) because NOW() changes constantly
-echo "Creating current queue wait time views..."
-
-# Point-in-time current queue wait (for single metric display)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS current_queue_wait_by_store AS
-SELECT
-    o.store_id,
-    COUNT(*) AS orders_waiting,
-    AVG(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS avg_wait_minutes,
-    MAX(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS max_wait_minutes,
-    MIN(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS min_wait_minutes
-FROM orders_flat_mv o
-WHERE o.order_status = 'CREATED'
-  AND o.order_created_at IS NOT NULL
-  AND mz_now() >= o.order_created_at
-GROUP BY o.store_id;"
-
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS current_queue_wait_system AS
-SELECT
-    COUNT(*) AS orders_waiting,
-    AVG(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS avg_wait_minutes,
-    MAX(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS max_wait_minutes,
-    MIN(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS min_wait_minutes
-FROM orders_flat_mv o
-WHERE o.order_status = 'CREATED'
-  AND o.order_created_at IS NOT NULL
-  AND mz_now() >= o.order_created_at;"
-
-# Current queue wait TIMESERIES - bucketed by order creation time
-# Shows wait times for orders STILL in queue, bucketed by 1-minute windows
-# This allows comparison with completed pickup wait times on the same chart
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE VIEW IF NOT EXISTS current_queue_wait_timeseries AS
-SELECT
-    DATE_TRUNC('minute', o.order_created_at) AS window_end,
-    EXTRACT(EPOCH FROM DATE_TRUNC('minute', o.order_created_at))::bigint * 1000 AS window_end_ms,
-    COUNT(*) AS orders_waiting,
-    AVG(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS queue_avg_wait_minutes,
-    MAX(EXTRACT(EPOCH FROM (NOW() - o.order_created_at)) / 60.0)::numeric(10,2) AS queue_max_wait_minutes
-FROM orders_flat_mv o
-WHERE o.order_status = 'CREATED'
-  AND o.order_created_at IS NOT NULL
-  AND mz_now() >= o.order_created_at
-  AND mz_now() <= o.order_created_at + INTERVAL '30 minutes'
-GROUP BY DATE_TRUNC('minute', o.order_created_at);"
-
-# Create index for the orders_flat_mv status lookups used by current queue wait views
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS orders_flat_status_idx IN CLUSTER serving ON orders_flat_mv (order_status);"
-
-echo "Creating indexes for timeseries queries..."
-
-# Indexes for timeseries queries
-# IMPORTANT: id index must come first - Zero requires an index on the primary key column
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS idx_store_metrics_timeseries_id IN CLUSTER serving ON store_metrics_timeseries_mv (id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS idx_system_metrics_timeseries_id IN CLUSTER serving ON system_metrics_timeseries_mv (id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS idx_store_metrics_timeseries_store_id IN CLUSTER serving ON store_metrics_timeseries_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS idx_store_metrics_timeseries_window IN CLUSTER serving ON store_metrics_timeseries_mv (window_end);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS idx_system_metrics_timeseries_window IN CLUSTER serving ON system_metrics_timeseries_mv (window_end);"
-
-# =============================================================================
-# DELIVERY BUNDLING WITH MUTUALLY RECURSIVE CONSTRAINTS
-# Demonstrates Materialize's WITH MUTUALLY RECURSIVE for Datalog-style logic
-#
-# Bundle orders that:
-# 1. Share the same store (required for pickup efficiency)
-# 2. Have overlapping delivery windows
-# 3. Don't exceed available inventory when combined
-# 4. Fit within courier vehicle capacity
-#
-# The mutual recursion pattern:
-#   - compatible_pair: base pairwise compatibility check
-#   - bundle_membership: assigns orders to bundles, referencing itself for clique validation
-#   - Fixed-point iteration until bundle assignments stabilize
-#
-# NOTE: This feature is opt-in due to high CPU usage (~460s elapsed time).
-# Enable with ENABLE_DELIVERY_BUNDLING=true
-# =============================================================================
-
-if [ "$ENABLE_DELIVERY_BUNDLING" = "true" ]; then
-    echo "Creating delivery bundling views with mutual recursion (ENABLE_DELIVERY_BUNDLING=true)..."
-
-    # Helper view: Order weights (total weight per order)
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-    CREATE VIEW IF NOT EXISTS order_weights AS
-    SELECT
-        ol.order_id,
-        SUM(ol.quantity * COALESCE(ol.unit_weight_grams, 0))::INT AS total_weight_grams
-    FROM order_lines_flat_mv ol
-    GROUP BY ol.order_id;"
-
-# Main mutually recursive view for delivery bundling
-# Produces one row per bundle with JSON array of orders
-# Each order appears in at most one bundle (greedy assignment to smallest bundle_id)
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS delivery_bundles_mv IN CLUSTER compute AS
-WITH MUTUALLY RECURSIVE (RETURN AT RECURSION LIMIT 100)
-    -- CTE 1: Pairwise compatibility - orders that CAN be bundled together
-    compatible_pair (order_a TEXT, order_b TEXT, store_id TEXT) AS (
-        SELECT
-            o1.order_id AS order_a,
-            o2.order_id AS order_b,
-            o1.store_id
-        FROM orders_flat_mv o1
-        JOIN orders_flat_mv o2
-            ON o1.store_id = o2.store_id
-            AND o1.order_id < o2.order_id
-        LEFT JOIN order_weights w1 ON w1.order_id = o1.order_id
-        LEFT JOIN order_weights w2 ON w2.order_id = o2.order_id
-        WHERE o1.order_status = 'CREATED'
-          AND o2.order_status = 'CREATED'
-          -- Overlapping delivery windows
-          AND o1.delivery_window_start::timestamptz <= o2.delivery_window_end::timestamptz
-          AND o2.delivery_window_start::timestamptz <= o1.delivery_window_end::timestamptz
-          -- Combined weight fits in VAN (50kg max)
-          AND (COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0)) <= 50000
-          -- No inventory conflict
-          AND NOT EXISTS (
-              SELECT 1
-              FROM order_lines_flat_mv ol1
-              JOIN order_lines_flat_mv ol2
-                  ON ol2.order_id = o2.order_id
-                  AND ol2.product_id = ol1.product_id
-              JOIN store_inventory_mv inv
-                  ON inv.product_id = ol1.product_id
-                  AND inv.store_id = o1.store_id
-              WHERE ol1.order_id = o1.order_id
-                AND ol1.quantity + ol2.quantity > inv.available_quantity
-          )
-          -- At least one compatible courier exists
-          AND EXISTS (
-              SELECT 1 FROM couriers_flat c
-              WHERE c.home_store_id = o1.store_id
-                AND c.courier_status = 'AVAILABLE'
-                AND (
-                    c.vehicle_type = 'VAN' OR
-                    (c.vehicle_type = 'CAR' AND
-                     COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0) <= 20000) OR
-                    (c.vehicle_type = 'BIKE' AND
-                     COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0) <= 5000)
-                )
-          )
-    ),
-
-    -- CTE 2: Bundle membership - assigns each order to a bundle
-    -- Bundle is identified by smallest order_id among mutually compatible orders
-    bundle_membership (order_id TEXT, bundle_id TEXT, store_id TEXT) AS (
-        -- Base: every CREATED order starts in its own bundle
-        SELECT o.order_id, o.order_id AS bundle_id, o.store_id
-        FROM orders_flat_mv o
-        WHERE o.order_status = 'CREATED'
-
-        UNION
-
-        -- Merge: order joins a smaller bundle if compatible with ALL its members
-        SELECT
-            bm1.order_id,
-            bm2.bundle_id,
-            bm1.store_id
-        FROM bundle_membership bm1
-        JOIN bundle_membership bm2
-            ON bm2.store_id = bm1.store_id
-            AND bm2.bundle_id < bm1.bundle_id
-        WHERE
-            -- Must be pairwise compatible with the bundle anchor
-            EXISTS (
-                SELECT 1 FROM compatible_pair cp
-                WHERE cp.store_id = bm1.store_id
-                  AND ((cp.order_a = bm2.bundle_id AND cp.order_b = bm1.order_id)
-                    OR (cp.order_a = bm1.order_id AND cp.order_b = bm2.bundle_id))
-            )
-            -- Must be compatible with ALL other orders already in that bundle
-            AND NOT EXISTS (
-                SELECT 1 FROM bundle_membership other
-                WHERE other.bundle_id = bm2.bundle_id
-                  AND other.order_id != bm1.order_id
-                  AND other.order_id != bm2.bundle_id
-                  AND NOT EXISTS (
-                      SELECT 1 FROM compatible_pair cp2
-                      WHERE cp2.store_id = bm1.store_id
-                        AND ((cp2.order_a = other.order_id AND cp2.order_b = bm1.order_id)
-                          OR (cp2.order_a = bm1.order_id AND cp2.order_b = other.order_id))
-                  )
-            )
-    )
-
--- Final output: one row per bundle with JSON array of orders
-SELECT
-    final.bundle_id,
-    final.store_id,
-    s.store_name,
-    jsonb_agg(final.order_id ORDER BY final.order_id) AS orders,
-    COUNT(*) AS bundle_size
-FROM (
-    -- Each order gets assigned to its SMALLEST valid bundle_id
-    SELECT order_id, MIN(bundle_id) AS bundle_id, store_id
-    FROM bundle_membership
-    GROUP BY order_id, store_id
-) final
-JOIN stores_mv s ON s.store_id = final.store_id
-GROUP BY final.bundle_id, final.store_id, s.store_name
-ORDER BY bundle_size DESC, bundle_id;"
-
-echo "Creating delivery bundling indexes..."
-
-# Serving indexes for delivery bundles
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS delivery_bundles_id_idx IN CLUSTER serving ON delivery_bundles_mv (bundle_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS delivery_bundles_store_idx IN CLUSTER serving ON delivery_bundles_mv (store_id);"
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS delivery_bundles_size_idx IN CLUSTER serving ON delivery_bundles_mv (bundle_size);"
-
-# =============================================================================
-# COMPATIBLE PAIRS VIEW - Exposes pairwise compatibility with details
-# Used by UI to show WHY orders are bundled together
-# =============================================================================
-
-echo "Creating compatible pairs view for bundle explanations..."
-
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS compatible_pairs_mv IN CLUSTER compute AS
-SELECT
-    o1.order_id || ':' || o2.order_id AS pair_id,
-    o1.order_id AS order_a,
-    o2.order_id AS order_b,
-    o1.store_id,
-    s.store_name,
-    -- Time overlap window
-    GREATEST(o1.delivery_window_start::timestamptz, o2.delivery_window_start::timestamptz)::text AS overlap_start,
-    LEAST(o1.delivery_window_end::timestamptz, o2.delivery_window_end::timestamptz)::text AS overlap_end,
-    -- Individual weights
-    COALESCE(w1.total_weight_grams, 0) AS order_a_weight_grams,
-    COALESCE(w2.total_weight_grams, 0) AS order_b_weight_grams,
-    -- Combined weight
-    (COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0)) AS combined_weight_grams
-FROM orders_flat_mv o1
-JOIN orders_flat_mv o2
-    ON o1.store_id = o2.store_id
-    AND o1.order_id < o2.order_id
-JOIN stores_mv s ON s.store_id = o1.store_id
-LEFT JOIN order_weights w1 ON w1.order_id = o1.order_id
-LEFT JOIN order_weights w2 ON w2.order_id = o2.order_id
-WHERE o1.order_status = 'CREATED'
-  AND o2.order_status = 'CREATED'
-  -- Overlapping delivery windows
-  AND o1.delivery_window_start::timestamptz <= o2.delivery_window_end::timestamptz
-  AND o2.delivery_window_start::timestamptz <= o1.delivery_window_end::timestamptz
-  -- Combined weight fits in VAN (50kg max)
-  AND (COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0)) <= 50000
-  -- No inventory conflict
-  AND NOT EXISTS (
-      SELECT 1
-      FROM order_lines_flat_mv ol1
-      JOIN order_lines_flat_mv ol2
-          ON ol2.order_id = o2.order_id
-          AND ol2.product_id = ol1.product_id
-      JOIN store_inventory_mv inv
-          ON inv.product_id = ol1.product_id
-          AND inv.store_id = o1.store_id
-      WHERE ol1.order_id = o1.order_id
-        AND ol1.quantity + ol2.quantity > inv.available_quantity
-  )
-  -- At least one compatible courier exists
-  AND EXISTS (
-      SELECT 1 FROM couriers_flat c
-      WHERE c.home_store_id = o1.store_id
-        AND c.courier_status = 'AVAILABLE'
-        AND (
-            c.vehicle_type = 'VAN' OR
-            (c.vehicle_type = 'CAR' AND
-             COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0) <= 20000) OR
-            (c.vehicle_type = 'BIKE' AND
-             COALESCE(w1.total_weight_grams, 0) + COALESCE(w2.total_weight_grams, 0) <= 5000)
-        )
-  );"
-
-# Create a unique key for compatible_pairs_mv
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS compatible_pairs_pk_idx IN CLUSTER serving ON compatible_pairs_mv (order_a, order_b);"
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS compatible_pairs_store_idx IN CLUSTER serving ON compatible_pairs_mv (store_id);"
-
-else
-    echo "Skipping delivery bundling views (ENABLE_DELIVERY_BUNDLING != true)"
-    echo "To enable, run: ENABLE_DELIVERY_BUNDLING=true make up-agent-bundling"
-
-    # Drop existing bundling views if they exist (from a previous bundling-enabled run)
-    # This ensures we replace full views with stub views
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "DROP MATERIALIZED VIEW IF EXISTS compatible_pairs_mv CASCADE;" 2>/dev/null || true
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "DROP MATERIALIZED VIEW IF EXISTS delivery_bundles_mv CASCADE;" 2>/dev/null || true
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "DROP VIEW IF EXISTS order_weights CASCADE;" 2>/dev/null || true
-
-    # Create empty stub views with same schema so materialize-zero doesn't crash
-    # These views return no rows but have the expected columns
-    # IMPORTANT: Must reference an upstream table (orders_flat_mv) so the frontier advances!
-    # Without an upstream dependency, the view's frontier stays stuck and blocks Zero sync.
-
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-    CREATE MATERIALIZED VIEW IF NOT EXISTS delivery_bundles_mv IN CLUSTER compute AS
-    SELECT
-        order_id AS bundle_id,
-        store_id AS store_id,
-        ''::text AS store_name,
-        '[]'::jsonb AS orders,
-        0::bigint AS bundle_size
-    FROM orders_flat_mv
-    WHERE order_id = '__stub_never_matches__';"
-
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-    CREATE MATERIALIZED VIEW IF NOT EXISTS compatible_pairs_mv IN CLUSTER compute AS
-    SELECT
-        order_id AS pair_id,
-        order_id AS order_a,
-        order_id AS order_b,
-        store_id AS store_id,
-        ''::text AS store_name,
-        ''::text AS overlap_start,
-        ''::text AS overlap_end,
-        0::int AS order_a_weight_grams,
-        0::int AS order_b_weight_grams,
-        0::int AS combined_weight_grams
-    FROM orders_flat_mv
-    WHERE order_id = '__stub_never_matches__';"
-
-    # Create indexes on stub views
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS delivery_bundles_id_idx IN CLUSTER serving ON delivery_bundles_mv (bundle_id);"
-    psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "CREATE INDEX IF NOT EXISTS compatible_pairs_pk_idx IN CLUSTER serving ON compatible_pairs_mv (order_a, order_b);"
-fi
-
-echo "Setting RETAIN HISTORY for materialize-zero compatibility..."
-# Without this, materialized views default to RETAIN HISTORY = 1s. When
-# zero-cache reconnects to the materialize-zero sidecar with a stored
-# lastWatermark older than 1s (which happens routinely during the burst of
-# ~14 simultaneous subscribes at boot, or after any zero-cache restart), mz
-# rejects the AS OF and the sidecar's error path sends `reset-required` to
-# zero-cache, which exits 14 (auto-reset). The cycle repeats indefinitely.
-#
-# The fix has to apply to the WHOLE dependency chain — Materialize's
-# `Timestamp (X) is not valid for all inputs` error is raised when the chosen
-# AS OF is below the `since` of *any* upstream collection, not just the leaf
-# MV. Setting retention only on the leaf MVs leaves pg_source at the default
-# 1s window and the loop continues. We set it on the postgres source AND the
-# 14 leaf MVs the sidecar subscribes to.
-#
-# Five minutes is comfortably longer than any reasonable resubscribe round-trip.
-# enable_logical_compaction_window must be on (set in the mz command in
-# docker-compose.yml).
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize <<'SQL'
-ALTER SOURCE pg_source SET (RETAIN HISTORY FOR '5 minutes');
--- Intermediate MVs: these aren't subscribed by materialize-zero directly,
--- but the leaf MVs depend on them, so their `since` constrains the
--- timestamp validity check (`Timestamp not valid for all inputs`).
-ALTER MATERIALIZED VIEW order_lines_flat_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_courier_metrics_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_metrics_by_window_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_metrics_timeseries_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_wait_time_by_window_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW system_metrics_timeseries_mv SET (RETAIN HISTORY FOR '5 minutes');
--- Leaf MVs that materialize-zero subscribes to:
-ALTER MATERIALIZED VIEW orders_flat_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW courier_schedule_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW customers_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW orders_search_source_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW products_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_inventory_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW stores_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW orders_with_lines_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW inventory_items_with_dynamic_pricing_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW pricing_yield_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW inventory_risk_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW store_capacity_health_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW delivery_bundles_mv SET (RETAIN HISTORY FOR '5 minutes');
-ALTER MATERIALIZED VIEW compatible_pairs_mv SET (RETAIN HISTORY FOR '5 minutes');
-SQL
-
-echo "Verifying three-tier setup..."
-echo ""
-echo "=== Clusters ==="
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SELECT name, replicas FROM (SHOW CLUSTERS) WHERE name IN ('ingest', 'compute', 'serving');"
-
-echo ""
-echo "=== Regular Views (intermediate transformations) ==="
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SELECT name FROM (SHOW VIEWS);"
-
-echo ""
-echo "=== Materialized Views (IN CLUSTER compute) ==="
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SELECT name, cluster FROM (SHOW MATERIALIZED VIEWS);"
-
-echo ""
-echo "=== Indexes (IN CLUSTER serving) ==="
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SELECT name, on AS view_name, cluster FROM (SHOW INDEXES);"
-
-echo ""
-echo "=== Order Count ==="
-COUNT=$(psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SET CLUSTER = serving; SELECT count(*) FROM orders_search_source_mv;")
-echo "Orders in Materialize: $COUNT"
-
-echo ""
-echo "Setting up Kafka sinks for the embedding pipeline (Redpanda)..."
-
-# Connections to Redpanda's Kafka API and its Confluent-compatible Schema
-# Registry. Redpanda exposes both; the broker's in-network listener is
-# redpanda:29092 and the schema registry is on :8081.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE CONNECTION IF NOT EXISTS kafka_connection TO KAFKA (
-    BROKER 'redpanda:29092',
-    SECURITY PROTOCOL = 'PLAINTEXT'
-);"
-
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE CONNECTION IF NOT EXISTS csr_connection TO CONFLUENT SCHEMA REGISTRY (
-    URL 'http://redpanda:8081'
-);"
-
-# Sink-specific views. Materialize encodes numeric/DECIMAL columns as Avro
-# `decimal` (a bytes logical type); the OpenSearch sink then serializes those
-# bytes as base64 strings, which fail to index into float fields. Casting the
-# numeric columns to `double precision` makes Avro emit plain doubles. We keep
-# these as thin views over the app-facing MVs so the API/Zero are untouched.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS orders_sink_v IN CLUSTER compute AS
-SELECT
-    order_id, order_number, order_status, store_id, customer_id,
-    -- Normalize all timestamps to ISO-8601 UTC strings. Some of these columns
-    -- are raw text (delivery_window_*/delivery_eta), others are timestamptz;
-    -- left as-is they reach OpenSearch as Postgres text (unparseable by the
-    -- date field) or as epoch-micros longs (misread as millis). to_char gives
-    -- one consistent format OpenSearch's strict_date_optional_time parses.
-    to_char(delivery_window_start::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS delivery_window_start,
-    to_char(delivery_window_end::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS delivery_window_end,
-    to_char(order_created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS order_created_at,
-    order_total_amount::double precision AS order_total_amount,
-    customer_name, customer_email, customer_address,
-    store_name, store_zone, store_address,
-    assigned_courier_id, delivery_task_status,
-    to_char(delivery_eta::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS delivery_eta,
-    line_items, embedding_text, line_item_count,
-    computed_total::double precision AS computed_total,
-    has_perishable_items,
-    total_weight_kg::double precision AS total_weight_kg,
-    to_char(effective_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS effective_updated_at
-FROM orders_with_lines_mv;"
-
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE MATERIALIZED VIEW IF NOT EXISTS inventory_sink_v IN CLUSTER compute AS
-SELECT
-    inventory_id, store_id, store_name, store_zone, product_id, product_name, category,
-    stock_level, reserved_quantity, available_quantity, perishable,
-    base_price::double precision AS base_price,
-    zone_adjustment::double precision AS zone_adjustment,
-    perishable_adjustment::double precision AS perishable_adjustment,
-    local_stock_adjustment::double precision AS local_stock_adjustment,
-    popularity_adjustment::double precision AS popularity_adjustment,
-    scarcity_adjustment::double precision AS scarcity_adjustment,
-    demand_multiplier::double precision AS demand_multiplier,
-    demand_premium::double precision AS demand_premium,
-    basket_adjustment::double precision AS basket_adjustment,
-    product_sale_count, product_total_stock,
-    live_price::double precision AS live_price,
-    price_change::double precision AS price_change,
-    to_char(effective_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS effective_updated_at
-FROM inventory_items_with_dynamic_pricing_mv;"
-
-# Orders sink: ENVELOPE DEBEZIUM so the message carries both the before and
-# after image. The perfect-embeddings SMT in Kafka Connect needs that pair to
-# diff the embedding_text column and skip re-embedding when it is unchanged.
-# Topic name 'orders' == the OpenSearch index name the sink connector writes to.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE SINK IF NOT EXISTS orders_sink
-    IN CLUSTER ingest
-    FROM orders_sink_v
-    INTO KAFKA CONNECTION kafka_connection (TOPIC 'orders')
-    KEY (order_id) NOT ENFORCED
-    FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_connection
-    ENVELOPE DEBEZIUM;"
-
-# Inventory sink: also DEBEZIUM. Inventory is NOT embedded (no SMT), but the
-# propagation-tap consumer reads the before/after image to compute field-level
-# change events for the System Performance card. The OpenSearch sink connector
-# unwraps the 'after' image via a standard ExtractField transform.
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -c "
-CREATE SINK IF NOT EXISTS inventory_sink
-    IN CLUSTER ingest
-    FROM inventory_sink_v
-    INTO KAFKA CONNECTION kafka_connection (TOPIC 'inventory')
-    KEY (inventory_id) NOT ENFORCED
-    FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_connection
-    ENVELOPE DEBEZIUM;"
-
-echo ""
-echo "=== Sinks ==="
-psql -h "$MZ_HOST" -p "$MZ_PORT" -U materialize -t -c "SELECT name, cluster FROM (SHOW SINKS);" || true
-
-echo ""
-echo "Materialize three-tier initialization complete!"
+echo "Materialize initialization complete."

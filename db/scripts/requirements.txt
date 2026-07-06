@@ -1,3 +1,0 @@
-# Requirements for data generation scripts
-psycopg2-binary>=2.9.0
-faker>=18.0.0

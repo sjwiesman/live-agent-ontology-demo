@@ -1,58 +1,33 @@
-"""Agent configuration."""
+"""Copilot configuration from environment variables."""
 
+import os
 from functools import lru_cache
-from typing import Optional
-
-from pydantic_settings import BaseSettings
 
 
-class Settings(BaseSettings):
-    """Agent settings loaded from environment variables."""
+class Settings:
+    def __init__(self) -> None:
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        # Sensible defaults per provider; override with AGENT_MODEL.
+        default_model = "claude-sonnet-5" if self.anthropic_api_key else "gpt-4o"
+        self.llm_model = os.getenv("AGENT_MODEL") or default_model
 
-    # API
-    agent_api_base: str = "http://api:8080"
+        self.api_base_url = os.getenv("API_BASE_URL", "http://localhost:8080")
 
-    # PostgreSQL (for agent checkpointing)
-    pg_host: str = "db"
-    pg_port: int = 5432
-    pg_user: str = "postgres"
-    pg_password: str = "postgres"
-    pg_database: str = "freshmart"
+        self.mz_host = os.getenv("MZ_HOST", "localhost")
+        self.mz_port = int(os.getenv("MZ_PORT", "6875"))
+        self.mz_user = os.getenv("MZ_USER", "materialize")
+        self.mz_password = os.getenv("MZ_PASSWORD", "materialize")
+        self.mz_database = os.getenv("MZ_DATABASE", "materialize")
 
-    # Materialize
-    mz_host: str = "mz"
-    mz_port: int = 5432
-    mz_user: str = "materialize"
-    mz_password: str = "materialize"
-    mz_database: str = "materialize"
-
-    # OpenSearch
-    agent_os_base: str = "http://opensearch:9200"
-
-    # LLM
-    openai_api_key: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
-    llm_model: str = "claude-sonnet-4-20250514"  # Default for Anthropic; use "gpt-4-turbo" for OpenAI
-
-    # Logging
-    log_level: str = "INFO"
-
-    @property
-    def mz_dsn(self) -> str:
-        """Get Materialize connection string."""
-        return f"postgresql+asyncpg://{self.mz_user}:{self.mz_password}@{self.mz_host}:{self.mz_port}/{self.mz_database}"
-
-    @property
-    def pg_dsn(self) -> str:
-        """Get PostgreSQL connection string for checkpointing."""
-        return f"postgresql://{self.pg_user}:{self.pg_password}@{self.pg_host}:{self.pg_port}/{self.pg_database}"
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+        # Write-back to the system of record (SQL Server).
+        self.mssql_host = os.getenv("MSSQL_HOST", "localhost")
+        self.mssql_port = int(os.getenv("MSSQL_PORT", "1433"))
+        self.mssql_user = os.getenv("MSSQL_USER", "sa")
+        self.mssql_password = os.getenv("MSSQL_SA_PASSWORD", "")
+        self.mssql_database = os.getenv("MSSQL_DATABASE", "ups")
 
 
-@lru_cache
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Get cached settings instance."""
     return Settings()

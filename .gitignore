@@ -68,3 +68,6 @@ aws/.state/
 
 # fastembed model cache (downloaded locally when running outside Docker)
 api/.fastembed_cache/
+
+# Local corporate-proxy CA certs used during docker builds
+*.crt

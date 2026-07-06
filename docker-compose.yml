@@ -1,78 +1,77 @@
 services:
-  # ============== Data Stores ==============
-  db:
-    image: postgres:15-alpine
+  # ============== System of record: SQL Server historian ==============
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
     environment:
-      POSTGRES_USER: ${PG_USER:-postgres}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
-      POSTGRES_DB: ${PG_DATABASE:-freshmart}
-    command: >
-      postgres
-      -c wal_level=logical
-      -c max_replication_slots=10
-      -c max_wal_senders=10
-      -c wal_writer_delay=10ms
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d/migrations:ro
-      - ./db/seed:/docker-entrypoint-initdb.d/seed:ro
-      - ./db/scripts/init-db.sh:/docker-entrypoint-initdb.d/00-init-db.sh:ro
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-StrongPassw0rd!}
+      # SQL Server Agent runs the CDC capture/cleanup jobs — required.
+      MSSQL_AGENT_ENABLED: "true"
     ports:
-      - "${PG_PORT:-5432}:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-freshmart}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # Database Seeder Service
-  # Runs seed SQL files and generates demo data
-  db-seed:
-    build:
-      context: ./db/scripts
-      dockerfile: Dockerfile
-    environment:
-      - PG_HOST=db
-      - PG_PORT=5432
-      - PG_USER=${PG_USER:-postgres}
-      - PG_PASSWORD=${PG_PASSWORD:-postgres}
-      - PG_DATABASE=${PG_DATABASE:-freshmart}
+      - "${MSSQL_PORT:-1433}:1433"
     volumes:
-      - ./db/seed:/seed:ro
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # One-shot: creates the ups database, schemas/tables, the materialize
+  # login, and enables CDC on every replicated table.
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      MSSQL_HOST: sqlserver
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-StrongPassw0rd!}
+      MZ_SQLSERVER_PASSWORD: ${MZ_SQLSERVER_PASSWORD:-MzPassw0rd!}
+    volumes:
+      - ./db/sqlserver:/scripts:ro
+    entrypoint: ["/bin/bash", "/scripts/init.sh"]
     depends_on:
-      db:
+      sqlserver:
         condition: service_healthy
     restart: "no"
-    profiles:
-      - seed
 
-  # Materialize Emulator (Real Materialize with admin console)
+  # Writes historian samples, package scans, and fleet telemetry into SQL
+  # Server continuously. Started before materialize-init on purpose: an
+  # idle SQL Server CDC stream only notifies consumers every 5 minutes, so
+  # live writes keep the Materialize snapshot fast.
+  simulator:
+    build:
+      context: ./simulator
+    environment:
+      MSSQL_HOST: sqlserver
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-StrongPassw0rd!}
+    ports:
+      - "${SIM_CONTROL_PORT:-8085}:8085"
+    depends_on:
+      sqlserver-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8085/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # ============== Materialize: the live context graph ==============
   mz:
     image: materialize/materialized:v26.24.0-dev.0--pr.g04fbfbd60143e627d4be9746fc09a8d7aa002322
-    # When the host laptop sleeps, MZ's persist-client heartbeat lease can
-    # expire and the process self-halts (exit 166). Without a restart policy
-    # the whole stack stays down on wake — and the materialize-zero sidecar
-    # then drives zero-cache into a reset loop trying to subscribe at
-    # timestamps MZ has compacted past. unless-stopped lets the host bring
-    # MZ back up automatically; if it does crash mid-session the recovery
-    # procedure is `docker compose down -v` + re-seed.
     restart: unless-stopped
     command: >
       --system-parameter-default=default_timestamp_interval=100ms
       --system-parameter-default=min_timestamp_interval=100ms
       --system-parameter-default=max_timestamp_interval=100ms
-      --system-parameter-default=enable_create_table_from_source=true
-      --system-parameter-default=enable_logical_compaction_window=true
     ports:
-      - "${MZ_CONSOLE_PORT:-6874}:6874"  # Admin Console
+      - "${MZ_CONSOLE_PORT:-6874}:6874"  # Admin console
       - "${MZ_PORT:-6875}:6875"          # SQL interface
       - "6876:6876"
-      - "6877:6877"
-    volumes:
-      - ./db/materialize/init_materialize.sql:/init_materialize.sql:ro
-    depends_on:
-      db:
-        condition: service_healthy
+      - "6877:6877"                      # mz_system SQL interface
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:6874/"]
       interval: 10s
@@ -80,400 +79,84 @@ services:
       retries: 30
       start_period: 30s
 
-  # Materialize Initialization Service
-  # This runs the init.sh script to create sources, views, indexes, and the
-  # Kafka sinks (orders/inventory) that feed the embedding pipeline. It must
-  # complete before the propagation-tap and connect-bootstrap services start.
+  # One-shot: clusters, SQL Server connection + source, silver/gold views,
+  # serving indexes.
   materialize-init:
     image: postgres:15-alpine
-    depends_on:
-      db:
-        condition: service_healthy
-      mz:
-        condition: service_healthy
-      redpanda:
-        condition: service_healthy
     environment:
-      - MZ_HOST=mz
-      - MZ_PORT=6875
-      - MZ_USER=materialize
-      - MZ_PASSWORD=materialize
-      - MZ_DATABASE=materialize
-      - ENABLE_DELIVERY_BUNDLING=${ENABLE_DELIVERY_BUNDLING:-false}
+      MZ_HOST: mz
+      MZ_PORT: 6875
+      MZ_SQLSERVER_PASSWORD: ${MZ_SQLSERVER_PASSWORD:-MzPassw0rd!}
     volumes:
       - ./db/materialize/init.sh:/init.sh:ro
     command: sh -c "/init.sh"
+    depends_on:
+      mz:
+        condition: service_healthy
+      sqlserver-init:
+        condition: service_completed_successfully
+      simulator:
+        condition: service_healthy
     restart: "no"
 
-  zero-cache:
-      image: rocicorp/zero:1.3.0
-      restart: always
-      container_name: zero-cache
-      depends_on:
-        db:
-          condition: service_healthy
-        materialize-zero:
-          condition: service_started
-      environment:
-          ZERO_UPSTREAM_TYPE: custom
-          ZERO_UPSTREAM_DB: "ws://materialize-zero:8080"
-          ZERO_REPLICA_FILE: "/data/replica.db"
-          ZERO_CVR_DB: "postgres://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@db:5432/zero_cvr"
-          ZERO_CHANGE_DB: "postgres://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@db:5432/zero_change"
-          ZERO_NUM_SYNC_WORKERS: 1
-          ZERO_ADMIN_PASSWORD: "admin"
-          ZERO_LOG_LEVEL: "info"
-      volumes:
-          # Anonymous volume — gives /data a writable spot for replica.db
-          # without persisting across container recreates. deploy.sh's
-          # `docker compose rm -fsv zero-cache` clears it on every deploy,
-          # keeping zero-cache in sync with Materialize's ephemeral state.
-          - /data
-      ports:
-          - "4848:4848"
-
-  materialize-zero:
-      image: a1q3r1n/materialize-zero:0.0.4
-      container_name: materialize-zero
-      depends_on:
-        mz:
-          condition: service_healthy
-        materialize-init:
-          condition: service_completed_successfully
-      environment:
-          MATERIALIZE_HOST_ADDRESS: ${MZ_HOST:-mz}:6876
-          MATERIALIZE_AUTH_OPTIONS_USER: ${MZ_USER:-materialize}
-          MATERIALIZE_AUTH_OPTIONS_PASSWORD: ${MZ_PASSWORD:-materialize}
-          MATERIALIZE_DATABASE: ${MZ_DATABASE:-materialize}
-          MATERIALIZE_COLLECTIONS: "orders_flat_mv,courier_schedule_mv,customers_mv,orders_search_source_mv,products_mv,store_inventory_mv,stores_mv,orders_with_lines_mv,inventory_items_with_dynamic_pricing_mv,pricing_yield_mv,inventory_risk_mv,store_capacity_health_mv,delivery_bundles_mv,compatible_pairs_mv"
-          PORT: 8080
-          LOG_LEVEL: ${LOG_LEVEL:-INFO}
-          NODE_ENV: production
-      logging:
-          driver: "json-file"
-          options:
-              max-size: "10m"
-              max-file: "3"
-      ports:
-          - "8082:8080"
-      extra_hosts:
-          - "host.docker.internal:host-gateway"
-
-  # Updates Zero permissions after materialize-zero creates the table
-  zero-permissions:
-      build:
-        context: .
-        dockerfile: zero-permissions/Dockerfile
-      container_name: zero-permissions
-      depends_on:
-        materialize-zero:
-          condition: service_started
-      environment:
-          MZ_HOST: ${MZ_HOST:-mz}
-          MZ_PORT: ${MZ_PORT:-6875}
-          MZ_USER: ${MZ_USER:-materialize}
-          MZ_PASSWORD: ${MZ_PASSWORD:-materialize}
-          MZ_DATABASE: ${MZ_DATABASE:-materialize}
-      restart: "no"
-
-  opensearch:
-    image: opensearchproject/opensearch:2.11.0
-    environment:
-      - discovery.type=single-node
-      - DISABLE_SECURITY_PLUGIN=true
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
-    volumes:
-      - opensearch_data:/usr/share/opensearch/data
-    ports:
-      - "${OS_PORT:-9200}:9200"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE 'green|yellow'"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  opensearch-dashboards:
-    image: opensearchproject/opensearch-dashboards:2.11.0
-    environment:
-      - OPENSEARCH_HOSTS=http://opensearch:9200
-      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
-    ports:
-      - "${OS_DASHBOARD_PORT:-5601}:5601"
-    depends_on:
-      opensearch:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 30s
-
-  # ============== Application Services ==============
+  # ============== Serving layer ==============
   api:
     build:
-      context: ./api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: api/Dockerfile
     environment:
-      - PG_HOST=${PG_HOST:-db}
-      - PG_PORT=5432
-      - PG_USER=${PG_USER:-postgres}
-      - PG_PASSWORD=${PG_PASSWORD:-postgres}
-      - PG_DATABASE=${PG_DATABASE:-freshmart}
-      - PG_EXTERNAL_URL=${PG_EXTERNAL_URL:-}
-      - MZ_HOST=${MZ_HOST:-mz}
-      - MZ_PORT=6875
-      - MZ_USER=${MZ_USER:-materialize}
-      - MZ_PASSWORD=${MZ_PASSWORD:-materialize}
-      - MZ_DATABASE=${MZ_DATABASE:-materialize}
-      - MZ_EXTERNAL_URL=${MZ_EXTERNAL_URL:-}
-      - OS_HOST=${OS_HOST:-opensearch}
-      - OS_PORT=9200
-      - OS_USER=${OS_USER:-}
-      - OS_PASSWORD=${OS_PASSWORD:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - USE_MATERIALIZE_FOR_READS=${USE_MATERIALIZE_FOR_READS:-true}
-      - ENABLE_DELIVERY_BUNDLING=${ENABLE_DELIVERY_BUNDLING:-false}
+      MZ_HOST: mz
+      MZ_PORT: 6875
+      MZ_USER: materialize
+      MZ_DATABASE: materialize
+      SIMULATOR_URL: http://simulator:8085
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
     ports:
       - "${API_PORT:-8080}:8080"
     depends_on:
-      db:
-        condition: service_healthy
-      mz:
-        condition: service_healthy
-      opensearch:
-        condition: service_healthy
+      materialize-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 5s
       timeout: 5s
-      retries: 5
-    volumes:
-      - ./api:/app:cached
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8080 --reload
-
-  # ============== Embedding Pipeline (Kafka / Connect / SMT) ==============
-  # Replaces the old Python search-sync worker. Data flow:
-  #   Materialize --CREATE SINK--> Redpanda (orders/inventory Debezium topics)
-  #     -> Kafka Connect (OpenSearch sink + perfect-embeddings SMT) -> OpenSearch
-  #     -> propagation-tap (reads the same topics to feed the :8083 events API)
-  # The SMT re-embeds only changed text by calling the local embeddings shim.
-
-  # Redpanda: lightweight Kafka-compatible broker + built-in Schema Registry.
-  # Internal listener redpanda:29092; schema registry on :8081 (both in-network).
-  redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
-    command:
-      - redpanda
-      - start
-      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:19092
-      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
-      - --rpc-addr=redpanda:33145
-      - --advertise-rpc-addr=redpanda:33145
-      - --mode=dev-container
-      - --smp=1
-      - --default-log-level=info
-    ports:
-      - "19092:19092"   # external Kafka (host access for debugging)
-      - "18081:18081"   # external Schema Registry (host access for debugging)
-    healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+      retries: 12
       start_period: 10s
+    restart: unless-stopped
 
-  # Local OpenAI-compatible embeddings endpoint (BAAI/bge-small-en-v1.5, 384-dim).
-  # The SMT calls this instead of the real OpenAI API — same model the API uses
-  # at query time, so index-time and query-time vectors are compatible.
-  embeddings:
+  agents:
     build:
-      context: ./embeddings-shim
-      dockerfile: Dockerfile
+      context: ./agents
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      API_BASE_URL: http://api:8080
+      MZ_HOST: mz
+      MZ_PORT: 6875
+      MZ_USER: materialize
+      MZ_DATABASE: materialize
+      MSSQL_HOST: sqlserver
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-StrongPassw0rd!}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
     ports:
-      - "8087:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
-  # Kafka Connect worker hosting the Aiven OpenSearch sink connector and the
-  # perfect-embeddings SMT (built into the image from the GitHub release).
-  connect:
-    build:
-      context: ./connect
-      dockerfile: Dockerfile
+      - "${AGENT_PORT:-8081}:8081"
     depends_on:
-      redpanda:
+      api:
         condition: service_healthy
-    environment:
-      CONNECT_BOOTSTRAP_SERVERS: redpanda:29092
-      CONNECT_GROUP_ID: embedding-connect
-      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
-      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
-      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
-      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
-      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
-      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://redpanda:8081
-      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://redpanda:8081
-      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_INTERNAL_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_INTERNAL_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_REST_ADVERTISED_HOST_NAME: connect
-      CONNECT_REST_PORT: "8083"
-      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components,/usr/share/local-connect-plugins
-      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
-      # Jolokia JVM agent exposes JMX (the embedding SMT's diff counters) over
-      # HTTP on :8778, read by the API's /api/search/embedding-metrics.
-      KAFKA_OPTS: "-javaagent:/usr/local/share/kafka/jolokia-agent.jar=port=8778,host=0.0.0.0"
-    ports:
-      - "8086:8083"   # Connect REST API (host access for debugging)
-      - "8778:8778"   # Jolokia (JMX over HTTP)
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 40s
-
-  # One-shot: create the OpenSearch indices with explicit mappings (knn_vector
-  # for orders, synonym analyzer for inventory) before the sink writes.
-  os-bootstrap:
-    image: curlimages/curl:8.11.1
-    depends_on:
-      opensearch:
-        condition: service_healthy
-    environment:
-      - OS_URL=http://opensearch:9200
-      - INDEX_DIR=/indices
-    volumes:
-      - ./os-bootstrap/create-indices.sh:/create-indices.sh:ro
-      - ./os-bootstrap:/indices:ro
-    entrypoint: ["/bin/sh", "/create-indices.sh"]
-    restart: "no"
-
-  # One-shot: register the OpenSearch sink connectors via the Connect REST API.
-  connect-bootstrap:
-    image: curlimages/curl:8.11.1
-    depends_on:
-      connect:
-        condition: service_healthy
-      embeddings:
-        condition: service_healthy
-      os-bootstrap:
-        condition: service_completed_successfully
-      materialize-init:
-        condition: service_completed_successfully
-    environment:
-      - CONNECT_URL=http://connect:8083
-      - CONNECTOR_DIR=/connectors
-    volumes:
-      - ./connect/register-connectors.sh:/register-connectors.sh:ro
-      - ./connect/connectors:/connectors:ro
-    entrypoint: ["/bin/sh", "/register-connectors.sh"]
-    restart: "no"
-
-  # Reproduces the write-propagation events the old worker emitted, by tapping
-  # the same Debezium topics. Serves the :8083 API the web PropagationContext
-  # polls — the web UI is unchanged.
-  propagation-tap:
-    build:
-      context: ./propagation-tap
-      dockerfile: Dockerfile
-    depends_on:
-      redpanda:
-        condition: service_healthy
-      materialize-init:
-        condition: service_completed_successfully
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=redpanda:29092
-      - SCHEMA_REGISTRY_URL=http://redpanda:8081
-      - TAP_TOPICS=orders,inventory
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    ports:
-      - "${PROPAGATION_API_PORT:-8083}:8083"
     restart: unless-stopped
 
   web:
     build:
       context: ./web
-      dockerfile: Dockerfile
     environment:
-      - VITE_API_URL=http://localhost:${API_PORT:-8080}
-      - VITE_ZERO_URL=http://localhost:4848
-      - VITE_AGENT_URL=http://localhost:${AGENT_PORT:-8081}
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8080}
+      VITE_AGENT_URL: ${VITE_AGENT_URL:-http://localhost:8081}
     ports:
       - "${WEB_PORT:-5173}:5173"
     depends_on:
       - api
-    volumes:
-      - ./web:/app:cached
-      - /app/node_modules
-    command: npm run dev -- --host
-
-  # Load Generator Control Service
-  load-generator:
-    build:
-      context: ./load-generator
-      dockerfile: Dockerfile
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
-    ports:
-      - "${LOADGEN_PORT:-8084}:8084"
-    depends_on:
-      api:
-        condition: service_healthy
-    volumes:
-      - ./load-generator:/app:cached
-
-  # ============== Agent Service (Optional Profile) ==============
-  agents:
-    build:
-      context: ./agents
-      dockerfile: Dockerfile
-    environment:
-      - AGENT_API_BASE=http://api:8080
-      - PG_HOST=${PG_HOST:-db}
-      - PG_PORT=5432
-      - PG_USER=${PG_USER:-postgres}
-      - PG_PASSWORD=${PG_PASSWORD:-postgres}
-      - PG_DATABASE=${PG_DATABASE:-freshmart}
-      - MZ_HOST=${MZ_HOST:-mz}
-      - MZ_PORT=6875
-      - MZ_USER=${MZ_USER:-materialize}
-      - MZ_PASSWORD=${MZ_PASSWORD:-materialize}
-      - MZ_DATABASE=${MZ_DATABASE:-materialize}
-      - AGENT_OS_BASE=http://opensearch:9200
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-    ports:
-      - "${AGENT_PORT:-8081}:8081"
-    depends_on:
-      db:
-        condition: service_healthy
-      api:
-        condition: service_healthy
-      opensearch:
-        condition: service_healthy
-    profiles:
-      - agent
-    volumes:
-      - ./agents:/app:cached
+    restart: unless-stopped
 
 volumes:
-  postgres_data:
-  opensearch_data:
-
-networks:
-  default:
-    name: freshmart-network
-    external: true
+  sqlserver_data:

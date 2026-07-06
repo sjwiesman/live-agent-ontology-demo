@@ -1,0 +1,212 @@
+# The UPS live context graph ontology.
+#
+# This file is the explicit map of the business: what entities exist, how
+# they relate, and which Materialize view serves each one live. The API
+# serves it at /api/ontology; the copilot loads it first on every request
+# so its reasoning follows real relationships instead of guesses.
+#
+# Every entity is mastered in the SQL Server historian/operational
+# database and continuously replicated into Materialize via CDC — the
+# graph below is queryable with millisecond point lookups and is never
+# more than a couple of seconds behind the physical world.
+
+domains:
+  - name: sortation
+    description: >
+      Hub sortation operations. The historian records time-series telemetry
+      (belt speed, motor temperature, vibration, throughput, scanner read
+      rate) and raises alarms (JAM, OVERTEMP, MISSORT, E_STOP) against
+      physical equipment.
+  - name: package_flow
+    description: >
+      Package movement through the network: induct, sort, load, linehaul,
+      delivery. Every movement is a scan event tied to a facility and,
+      where applicable, a specific piece of equipment.
+  - name: fleet
+    description: >
+      Tractors and package cars, their drivers, telematics fault codes,
+      and maintenance work orders.
+
+classes:
+  - name: Facility
+    domain: package_flow
+    id_field: facility_id
+    id_example: HUB-LOU
+    description: A sortation hub (e.g. Worldport in Louisville).
+    backed_by:
+      table: ops.facilities
+      live_views: [hub_health_mv, hub_throughput_minute_mv]
+
+  - name: Equipment
+    domain: sortation
+    id_field: equipment_id
+    id_example: LOU-SORT-04
+    description: >
+      A conveyor, scanner, or sorter inside a facility. Carries live
+      historian telemetry and alarm state.
+    backed_by:
+      table: ops.equipment
+      live_views: [equipment_status_mv, active_alarms]
+
+  - name: HistorianTag
+    domain: sortation
+    id_field: tag_id
+    description: >
+      A named time-series signal on a piece of equipment (belt_speed_fpm,
+      motor_temp_c, vibration_mm_s, throughput_pph, read_rate_pct).
+    backed_by:
+      table: historian.tags
+      live_views: [equipment_tag_stats_5m]
+
+  - name: Alarm
+    domain: sortation
+    id_field: alarm_id
+    description: >
+      A historian alarm raised against equipment. Cleared by the source
+      system; acknowledged by workers (or the copilot, on their behalf).
+    backed_by:
+      table: historian.alarms
+      live_views: [active_alarms]
+
+  - name: Package
+    domain: package_flow
+    id_field: package_id
+    id_example: 1Z999AA0123456789
+    description: >
+      A shipment moving through the network. Carries a service level, a
+      delivery promise, a sort plan (which sorter it is routed through),
+      and live risk derived from the equipment, trailer, and tractor it
+      depends on right now.
+    backed_by:
+      table: ops.packages
+      live_views: [package_context_mv, late_package_risk_v]
+
+  - name: ScanEvent
+    domain: package_flow
+    id_field: scan_id
+    description: >
+      An append-only package scan (ORIGIN, INDUCT, SORT, LOAD, DEPART,
+      ARRIVE, DELIVER) at a facility, optionally via specific equipment.
+    backed_by:
+      table: ops.scan_events
+      live_views: [latest_package_scan]
+
+  - name: Trailer
+    domain: package_flow
+    id_field: trailer_id
+    id_example: TRL-1010
+    description: A trailer loading at a dock door or moving on a route.
+    backed_by:
+      table: ops.trailers
+      live_views: [package_context_mv]
+
+  - name: Route
+    domain: package_flow
+    id_field: route_id
+    id_example: RT-LOU-CHI-1
+    description: A scheduled linehaul lane between two facilities.
+    backed_by:
+      table: ops.routes
+      live_views: []
+
+  - name: Vehicle
+    domain: fleet
+    id_field: vehicle_id
+    id_example: TRC-110
+    description: A tractor (pulls trailers) or package car (last mile).
+    backed_by:
+      table: fleet.vehicles
+      live_views: [fleet_risk_mv]
+
+  - name: Driver
+    domain: fleet
+    id_field: driver_id
+    description: A driver, optionally assigned to a vehicle.
+    backed_by:
+      table: fleet.drivers
+      live_views: [fleet_risk_mv]
+
+  - name: VehicleFault
+    domain: fleet
+    id_field: fault_id
+    description: >
+      An active or historical telematics fault (SPN code) on a vehicle,
+      classified by severity and subsystem.
+    backed_by:
+      table: fleet.vehicle_faults
+      live_views: [fleet_risk_mv]
+
+  - name: MaintenanceOrder
+    domain: fleet
+    id_field: work_order_id
+    id_example: WO-1719877200
+    description: >
+      A maintenance work order on a vehicle. The copilot can create these
+      directly in the system of record.
+    backed_by:
+      table: fleet.maintenance_orders
+      live_views: [fleet_risk_mv]
+
+relationships:
+  - name: located_at
+    from: Equipment
+    to: Facility
+    via: equipment.facility_id
+  - name: measures
+    from: HistorianTag
+    to: Equipment
+    via: tags.equipment_id
+  - name: raised_on
+    from: Alarm
+    to: Equipment
+    via: alarms.equipment_id
+  - name: scanned_at
+    from: ScanEvent
+    to: Facility
+    via: scan_events.facility_id
+  - name: scanned_by
+    from: ScanEvent
+    to: Equipment
+    via: scan_events.equipment_id
+  - name: scan_of
+    from: ScanEvent
+    to: Package
+    via: scan_events.package_id
+  - name: sort_planned_through
+    from: Package
+    to: Equipment
+    via: packages.planned_sort_equipment_id
+    note: >
+      The cross-silo link that makes jams actionable: a package is at risk
+      the moment its planned sorter goes down, before it ever reaches it.
+  - name: loaded_on
+    from: Package
+    to: Trailer
+    via: packages.assigned_trailer_id
+  - name: runs_route
+    from: Trailer
+    to: Route
+    via: trailers.route_id
+  - name: pulled_by
+    from: Trailer
+    to: Vehicle
+    via: trailers.tractor_vehicle_id
+    note: >
+      The package-to-fleet bridge: a critical engine fault on this tractor
+      puts every package loaded on the trailer at risk.
+  - name: fault_on
+    from: VehicleFault
+    to: Vehicle
+    via: vehicle_faults.vehicle_id
+  - name: maintains
+    from: MaintenanceOrder
+    to: Vehicle
+    via: maintenance_orders.vehicle_id
+  - name: drives
+    from: Driver
+    to: Vehicle
+    via: drivers.assigned_vehicle_id
+  - name: based_at
+    from: Vehicle
+    to: Facility
+    via: vehicles.home_facility_id

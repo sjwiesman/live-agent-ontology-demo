@@ -1,1 +1,0 @@
-# FreshMart Digital Twin API

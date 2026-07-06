@@ -1,457 +1,130 @@
-# Live Context Graph Demo
+# UPS Historian → Live Context Graph Demo
 
-A demo of how Materialize provides **live, pre-assembled context** for AI agents — using FreshMart same-day grocery delivery as a concrete scenario.
+A demo of how **Materialize** turns a SQL Server–backed historian into a **live context graph** that powers AI copilots for hub workers.
 
-## What Is This?
+## The scenario
 
-This project shows an AI agent architecture where:
+UPS runs an industrial **historian** on SQL Server: time-series telemetry from sortation equipment (belt speed, motor temperature, vibration, throughput, scanner read rates), alarms, and the operational tables around them — packages, scan events, trailers, routes, vehicles, drivers, faults, maintenance orders.
 
-- Operational data (orders, inventory, couriers) is written as **RDF-style triples** into PostgreSQL
-- **Materialize** continuously maintains denormalized read models from CDC — no batch ETL, no stale snapshots
-- **OpenSearch** indexes those documents with 384-dim embeddings for **hybrid vector + keyword search**
-- A **React demo UI** lets you observe the full propagation chain: write a triple → watch it ripple through Materialize views, the search index, and the embedding in real time
+The data lives in three silos that workers correlate by hand today:
 
-The demo makes three architectural approaches directly comparable — switch between **Postgres (OLTP)**, **Batch**, and **Materialize (incremental view maintenance)** to see what changes at each layer.
+1. **Sortation** (the historian): equipment telemetry + alarms
+2. **Package flow**: packages, scans, trailers, linehaul routes
+3. **Fleet**: tractors, telematics fault codes, maintenance
 
-**Why it matters:** AI agents need context that reflects the business *right now*. The traditional tradeoff between freshness and latency disappears when your read model is continuously maintained rather than periodically rebuilt.
+The questions that matter cross the silos:
 
-## Quick Start
+> *"Why is package 1Z999AA… at risk?"*
+> Because sorter **LOU-SORT-04** in its sort plan has a **JAM alarm** (historian → package), **and** the tractor pulling its outbound trailer has a **low-oil-pressure fault** (fleet → package).
+
+This repo builds that answer as a **continuously-maintained SQL view**. Materialize ingests SQL Server CDC and incrementally maintains cross-silo joins so the pre-assembled answer is always current — no batch ETL, no stale caches, no fan-out queries at request time. An AI copilot reads the graph in millisecond point lookups and **writes back** to the system of record.
+
+```
+Simulator ──▶ SQL Server 2022 (historian / ops / fleet schemas, CDC enabled)
+                   │  Change Data Capture (~1-2s)
+                   ▼
+             Materialize
+               silver: latest-state views (DISTINCT ON + temporal filters)
+               gold:   package_context_mv · hub_health_mv · equipment_status_mv
+                       fleet_risk_mv · hub_throughput_minute_mv  (compute cluster)
+               serving: indexes for ms point lookups  (serving cluster)
+                   │
+        ┌──────────┴───────────┐
+   FastAPI API :8080      LangGraph copilot :8081
+   (dashboard reads)      (9 tools; write-back via SQL Server)
+        │                      │
+   React dashboard :5173 ── chat widget (SSE)
+```
+
+## Quick start
+
+Requirements: Docker with ~6 GB free RAM. On Apple Silicon, enable Rosetta emulation in Docker Desktop (the SQL Server image is amd64-only) and expect a slower first boot.
 
 ```bash
-git clone https://github.com/nstewart/live-context-graph-demo.git
-cd live-context-graph-demo
-cp .env.example .env
-
-# Install uv (Python package manager) if not already installed
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Start all services
-make up
-
-# Or start with the LangGraph agent included
-make up-agent
+git clone <this-repo> && cd <this-repo>
+make setup          # creates .env — add ANTHROPIC_API_KEY (or OPENAI_API_KEY) for the copilot
+make up             # builds and starts everything (~2-3 min first time)
 ```
 
-**Services will be ready at:**
-- Demo UI: http://localhost:5173
-- API Docs: http://localhost:8080/docs
-- Materialize Console: http://localhost:6874
-- OpenSearch: http://localhost:9200
-
-The system seeds demo data automatically: 5 stores, 15 products, 15 customers, 20 orders.
-
-## Demo Walkthrough
-
-Open the **Freshmart Demo** page at http://localhost:5173. The page has three main sections:
-
-### 1. Architecture Diagram
-
-An interactive diagram that switches between three scenarios:
-
-- **Materialize** — CDC from OLTP sources → incremental view maintenance (Bronze/Silver/Gold medallion) → indexed queries. Agent and MCP Server nodes show the Observe/Act interaction pattern with animated edges.
-- **Batch** — same medallion structure, static arrow flow, no incremental maintenance.
-- **Postgres (OLTP)** — single OLTP box with a Base Tables layer and a Business Logic layer; no medallion bands.
-
-### 2. Context & Lineage
-
-A live API response showing what an agent receives when it queries Materialize for order context — pre-assembled with customer, store, courier, line items, and dynamic pricing in a single read.
-
-### 3. System Performance
-
-Response time and reaction time charts comparing query patterns across scenarios, plus live order cards that update in real time via Zero WebSocket sync.
-
-#### Write a Triple
-
-Enter a subject (`order:FM-1001`), pick a predicate, set a value, and click **Write**. This writes to the PostgreSQL triple store; you can watch propagation immediately:
-
-- The order card in the UI updates via Zero (sub-second)
-- The **Search Index Updates** bar fills in colored marks as each affected document is re-indexed in OpenSearch — one mark per document, positioned proportionally across a 65k virtual space so 94 out of 8,000 docs looks sparse, not full
-
-### 4. Hybrid Vector Search
-
-The **Vector Pipeline** section embeds your natural language query using `BAAI/bge-small-en-v1.5` (384-dim), runs a kNN search against OpenSearch, then hydrates each hit from Materialize at request time for live fields.
-
-- Filter by delivery zone or order status for hybrid kNN + keyword search
-- Each result card shows the order's embedding hex fingerprint, embedding source text, line items with live vs. base pricing, and a % match score
-- After writing a triple, the embedding fingerprint and text block flash yellow when that order is re-embedded
-
-## Architecture
-
-```
-Write path:
-  API → PostgreSQL (triple store, ontology-validated)
-                ↓ CDC
-                Materialize (incremental views: orders, inventory, pricing)
-                ↓ SUBSCRIBE
-                Zero Server → WebSocket → UI (live order cards)
-                ↓ CREATE SINK (ENVELOPE DEBEZIUM, Avro + Schema Registry)
-                Redpanda (orders / inventory CDC topics)
-                ├─→ Kafka Connect
-                │     • perfect-embeddings SMT → embeddings shim (bge-small)
-                │     • Aiven OpenSearch sink (UPSERT)
-                │         ↓
-                │     OpenSearch
-                │       orders index: text fields + 384-dim embedding vector
-                │       inventory index: text fields
-                └─→ propagation-tap → :8083 (System Performance card)
-
-Read path (agent context):
-  Agent/UI → Materialize (pre-assembled context, millisecond latency)
-
-Read path (semantic search):
-  Query → fastembed (BAAI/bge-small-en-v1.5) → OpenSearch kNN
-         → Materialize hydration (live price, status, timestamps)
-         → merged result card
-```
-
-**Key property:** embeddings stay fresh without re-embedding unchanged content. Materialize sinks each order as an `ENVELOPE DEBEZIUM` change event; the [perfect-embeddings](https://github.com/MaterializeInc/perfect-embedding) Kafka Connect SMT re-embeds an order **only when its `embedding_text` column changes** (a product added/renamed), and otherwise preserves the existing vector via a partial UPSERT. The embedding call goes to a local OpenAI-compatible shim wrapping `bge-small`, so there is no external API cost.
-
-## How Vector Embeddings Stay in Sync
-
-Embedding is expensive, so the index must re-embed an order **only when the text that gets embedded actually changes** — never on a price, quantity, or status edit. This demo gets that property from [**perfect-embeddings**](https://github.com/MaterializeInc/perfect-embedding), a Kafka Connect SMT (Single Message Transform) that diffs Materialize change events and re-embeds only modified text columns.
-
-### Data Flow
-
-```
-PostgreSQL (triple writes)
-      ↓ CDC
-Materialize (orders_with_lines_mv)
-  — exposes embedding_text = string_agg(product_name (category), ' | ')
-      ↓ CREATE SINK ... ENVELOPE DEBEZIUM   (Avro + Confluent Schema Registry)
-Redpanda topic "orders"  (each msg carries before + after image)
-      ↓
-Kafka Connect
-  perfect-embeddings SMT (EmbeddingDiffTransform)
-    before.embedding_text == after.embedding_text ?
-      ↙ unchanged                         ↘ changed (or insert)
-   omit embedding field             POST /v1/embeddings → embeddings shim
-   (vector preserved)               (bge-small) → embedding_text_embedding
-      ↓
-  Aiven OpenSearch sink (index.write.method=UPSERT, partial doc merge)
-      ↓
-OpenSearch (knn_vector index, 384 dims)
-```
-
-### The Smart Dedup Pattern
-
-Instead of hashing in application code, we expose the **raw embedding input as a column** in the Materialize view and let the SMT diff it. A price-only change produces a new Debezium event, but `embedding_text` is byte-identical, so the SMT skips the embeddings call and the UPSERT omits the vector field — leaving the prior vector untouched in OpenSearch.
-
-```sql
--- Materialize view: orders_with_lines_mv  (db/materialize/init.sh)
-SELECT
-  ...
-  COALESCE(
-    string_agg(
-      product_name || ' (' || COALESCE(category, '') || ')',
-      ' | '
-      ORDER BY line_sequence
-    ) FILTER (WHERE product_name IS NOT NULL AND product_name <> ''),
-    ''
-  ) AS embedding_text,            -- the exact text the model embeds
-  ...
-
--- Sink it as a Debezium change stream so the SMT sees before + after:
-CREATE SINK orders_sink IN CLUSTER ingest
-  FROM orders_with_lines_mv
-  INTO KAFKA CONNECTION kafka_connection (TOPIC 'orders')
-  KEY (order_id) NOT ENFORCED
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_connection
-  ENVELOPE DEBEZIUM;
-```
-
-The SMT's decision, conceptually:
-
-```text
-# perfect-embeddings EmbeddingDiffTransform, per record, per embedded column
-for col in embedded.columns:                 # here: ["embedding_text"]
-    if record.before is None:                # INSERT  -> embed
-        record[col + "_embedding"] = embed(record.after[col])
-    elif record.before[col] != record.after[col]:   # text changed -> embed
-        record[col + "_embedding"] = embed(record.after[col])
-    else:                                     # unchanged -> leave field absent
-        pass                                  # UPSERT preserves the old vector
-```
-
-### Using a cheap local model (no OpenAI key)
-
-The SMT speaks the OpenAI embeddings protocol, but the endpoint is overridable — so we point it at a tiny local service (`embeddings-shim/`) that wraps the **same** `BAAI/bge-small-en-v1.5` model the API uses at query time. No external API, no per-embed cost, and index-time/query-time vectors stay in the same 384-dim space.
-
-```jsonc
-// connect/connectors/orders-opensearch-sink.json  (Kafka Connect connector config)
-{
-  "connector.class": "io.aiven.kafka.connect.opensearch.OpensearchSinkConnector",
-  "topics": "orders",
-  "connection.url": "http://opensearch:9200",
-  "index.write.method": "upsert",          // partial merge -> preserves vector
-  "behavior.on.null.values": "delete",
-  "transforms": "extractKey,embed",
-  "transforms.extractKey.type": "org.apache.kafka.connect.transforms.ExtractField$Key",
-  "transforms.extractKey.field": "order_id",
-  "transforms.embed.type": "com.materialize.connect.smt.embedding.EmbeddingDiffTransform",
-  "transforms.embed.embedded.columns": "embedding_text",
-  "transforms.embed.provider": "openai",
-  "transforms.embed.openai.endpoint": "http://embeddings:8080/v1/embeddings", // local shim
-  "transforms.embed.openai.api.key": "local-no-key-needed",
-  "transforms.embed.openai.model": "BAAI/bge-small-en-v1.5",
-  "transforms.embed.openai.dimensions": "384"
-}
-```
-
-```python
-# embeddings-shim/app.py — OpenAI-compatible endpoint backed by local fastembed
-from fastembed import TextEmbedding
-model = TextEmbedding("BAAI/bge-small-en-v1.5")   # 384-dim, local ONNX, ~130MB
-
-@app.post("/v1/embeddings")
-def embeddings(req):                               # {"input": "<text>", "model": ...}
-    texts = [req.input] if isinstance(req.input, str) else req.input
-    vectors = [list(v) for v in model.embed(texts)]
-    return {"object": "list", "model": req.model,
-            "data": [{"object": "embedding", "index": i, "embedding": v}
-                     for i, v in enumerate(vectors)]}
-```
-
-### Query-time Embedding
-
-Search queries use the same model so vector spaces are compatible (the API embeds the query locally; the SMT's output field is `embedding_text_embedding`):
-
-```python
-# Pseudocode: GET /api/search/vector/orders?q=<query>
-
-query_vector = embedder.embed([query_text])[0]   # 384-dim float list, bge-small
-
-results = opensearch.knn_search(
-    index="orders",
-    field="embedding_text_embedding",             # produced by the SMT
-    vector=query_vector,
-    k=10,
-    filter={"order_status": status, "store_zone": zone}  # optional hybrid filters
-)
-
-# Hydrate with live fields from Materialize (price, status, timestamps)
-for hit in results:
-    hit.live_data = materialize.query(order_id=hit.id)
-```
-
-### Embedding Model
-
-| Property | Value |
-|----------|-------|
-| Model | `BAAI/bge-small-en-v1.5` |
-| Dimensions | 384 |
-| Runtime | fastembed / ONNX (local CPU), served over an OpenAI-compatible HTTP shim |
-| Index field | `embedding_text_embedding` (`knn_vector`) in OpenSearch |
-
-**Replicating this pattern:** the structural insight is transport- and model-agnostic. Materialize emits a Debezium change stream; the perfect-embeddings SMT re-embeds only changed text columns; an UPSERT sink preserves untouched vectors. Swap the local shim for the real OpenAI API by changing `transforms.embed.openai.endpoint`/`api.key`; swap OpenSearch for Elasticsearch by using the Confluent ES sink (`write.method=UPSERT`).
-
-## Cross-encoder reranking
-
-Vector search is fast but approximate — it embeds the query and each order independently and matches by nearest vector. Reranking adds a second, sharper pass. The `/vector/orders/reranked` endpoint takes the top candidates from vector search and re-scores them with a **cross-encoder** (`Xenova/ms-marco-MiniLM-L-6-v2`), a model that reads the query and an order *together* and judges relevance far more precisely than separately-embedded vectors can.
-
-What makes this practical in production is that the cross-encoder scores each order against its **current** state — line items, category, live price, stock, and status. Materialize keeps that context continuously up to date from the change stream, so there's no nightly rebuild and no staleness: edit an order and the next search reranks against the new reality. The latency breakdown surfaces the cost of each stage — retrieval, fetching the order context from Materialize, and the rerank itself — so you can see where the time goes.
-
-Toggle **Rerank (cross-encoder)** on the Vector Pipeline card to compare the two side by side, row per candidate: ① where vector search ranked it · ② the document the model scored and its cross-encoder score · ③ the reranked position and how far it moved.
-
----
-
-## Core Components
-
-### Embedding pipeline (Kafka / Connect / SMT)
-
-Materialize sinks the `orders` and `inventory` views into Redpanda; Kafka Connect indexes them into OpenSearch:
-
-- **`connect`** — Kafka Connect worker hosting the Aiven OpenSearch sink connector plus the [perfect-embeddings](https://github.com/MaterializeInc/perfect-embedding) SMT. The orders connector runs the `embed` SMT (re-embeds only when `embedding_text` changes); the inventory connector just unwraps the Debezium `after` image (no embeddings).
-- **`embeddings`** (`embeddings-shim/`) — OpenAI-compatible `/v1/embeddings` endpoint wrapping local `BAAI/bge-small-en-v1.5`. This is the "cheap local model" the SMT calls.
-- **`propagation-tap`** (`propagation-tap/`) — consumes the Debezium topics and computes field-level change events from the before/after image, serving the `:8083` propagation API that powers the **System Performance** card.
-- **`os-bootstrap` / `connect-bootstrap`** — one-shot init containers. `os-bootstrap` installs a composable **index template** per index (knn_vector + synonym analyzer) and pre-creates the index so it materializes that mapping — the Aiven connector's auto-create bypasses templates, so the index must exist before the sink writes. `connect-bootstrap` registers the sink connectors.
-- **Embedding savings metrics** — the SMT exposes diff counters (`EmbeddingsComputed` / `EmbeddingsSkipped`) as a JMX MBean; a Jolokia agent on `connect` exposes them over HTTP, the API reads them at `/api/search/embedding-metrics`, and the Vector Pipeline card shows a live "**N% embedding calls avoided**" ticker — the perfect-embeddings dedup payoff, quantified.
-
-### API (`/api/search`)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /vector/orders` | Embed query → kNN → hydrate from Materialize. Accepts `store_zone` and `order_status` filters for hybrid search. |
-| `GET /vector/orders/reranked` | Two-stage: kNN recall (`candidates`, default 25) → cross-encoder rerank. Returns both orderings + each candidate's rerank input/score + stage timings. |
-| `GET /impact?since_mz_timestamp=T` | Count docs re-indexed across orders + inventory since timestamp T. Returns combined impacted/total/pct plus per-index breakdown. All four OpenSearch `_count` calls run concurrently. |
-| `GET /index-stats` | Total doc count from OpenSearch |
-| `GET /embedding-metrics` | Embedding SMT diff counters (computed / skipped / skip ratio) read from the Connect worker via Jolokia. Degrades to `available:false` when Connect/Jolokia is down. |
-
-### Dynamic Pricing Engine
-
-Materialize maintains live pricing through composable views:
-
-- **Zone premiums**: Manhattan +15%, Brooklyn +5%
-- **Perishability discounts**: 5% off to move inventory
-- **Scarcity premiums**: +10% for low stock items
-- **Demand multipliers**: based on rolling 7-day sales velocity
-
-### LangGraph Agent (optional)
-
-An Operations Assistant with SSE streaming, PostgreSQL-backed conversation memory, and tools for reading context from Materialize and writing triples. Start with `make up-agent` and access via the floating chat widget in the UI.
-
-## Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| **db** | 5432 | PostgreSQL — triple store |
-| **mz** | 6874 | Materialize Admin Console |
-| **mz** | 6875 | Materialize SQL interface |
-| **zero-cache** | 4848 | Zero WebSocket server for real-time UI sync |
-| **opensearch** | 9200 | Search + kNN vector index |
-| **api** | 8080 | FastAPI backend |
-| **redpanda** | 19092 / 18081 | Kafka broker + Schema Registry (CDC sink target) |
-| **connect** | 8086 | Kafka Connect (OpenSearch sink + perfect-embeddings SMT) |
-| **embeddings** | 8087 | Local OpenAI-compatible bge-small endpoint |
-| **propagation-tap** | 8083 | CDC tap + propagation events API |
-| **web** | 5173 | React demo UI |
-| **agents** | 8081 | LangGraph agent with SSE streaming (optional) |
-
-## Development
-
-**Note:** Doesn't run well with Zoom in parallel locally. Use the AWS path for screen-share demos.
+| Service | URL |
+|---|---|
+| Dashboard | http://localhost:5173 |
+| API (Swagger) | http://localhost:8080/docs |
+| Copilot | http://localhost:8081 |
+| Materialize console | http://localhost:6874 |
+| SQL Server | localhost:1433 (`sa` / your `.env` password) |
+
+The simulator seeds 3 hubs (Worldport/Louisville, Chicago, Dallas), 30 pieces of equipment with ~90 historian tags, 30 vehicles, 20 trailers, and keeps a few hundred packages flowing continuously. A conveyor jam auto-fires every ~4 minutes so the dashboard always has a story; trigger your own with the buttons in the header or:
 
 ```bash
-# Start all services
-make up
-
-# Start with agent
-make up-agent
-
-# Stop (data persists)
-make down
-
-# View logs
-docker compose logs -f api
-docker compose logs -f connect propagation-tap embeddings   # or: make logs-sync
-
-# Track write propagation (clean output)
-docker compose logs -f api propagation-tap | sed 's/.*INFO - //'
-
-# Restart a single service
-docker compose restart api
-
-# Run tests
-docker compose exec api python -m pytest tests/ -v
-
-# See all commands
-make help
+make jam              # jam LOU-SORT-04 at Worldport
+make tractor-fault    # critical engine fault on a tractor with a loading trailer
+make scanner-degraded # scanner read-rate drops, MISSORT alarms
 ```
 
-### AWS deployment
+## Demo walkthrough
 
-```bash
-make aws-debug          # verify setup
-make up-aws             # deploy without agent
-make up-agent-aws       # deploy with agent
-make down-aws           # tear down
+1. **Steady state.** Open the dashboard: three hubs HEALTHY, sorters at ~8,000 pph, packages flowing (scans/10m), no alarms. Open **The Ontology** panel at the bottom — this is the explicit map of the context graph, and *exactly* what the copilot loads on every request.
+
+2. **Break something.** `make jam`. Within a couple of seconds: Worldport flips **CRITICAL**, a JAM alarm appears, LOU-SORT-04's chip goes red with collapsed throughput and climbing temperature, and **At-Risk Packages** fills with HIGH-risk packages — packages that are *upstream* of the jammed sorter, linked through their sort plan before they ever reach it.
+
+3. **Ask the copilot.** Click the chat bubble and ask: *"Why is package 1Z… at risk?"* (pick one from the tile). Watch the tool calls stream: it loads the ontology, looks up the package, reads the pre-joined context, and explains the full chain — package → planned sorter → JAM alarm → risk. Then try *"What's happening at Worldport?"* and *"Which packages should we act on first?"* (it uses the promise-window view).
+
+4. **Act through the copilot.** `make tractor-fault`, then ask the copilot about fleet risk — it will find the faulted tractor *and how many packages are sitting on its trailer*. Tell it: *"Acknowledge the jam alarm and open a HIGH priority work order for that tractor — I'm supervisor Dana."* Both write-backs go to **SQL Server** (the system of record), flow back through CDC, and the dashboard updates in seconds: alarm shows `ack: Dana`, vehicle shows an open WO, and the jam clears.
+
+5. **Prove it's real.** `make shell-sqlserver` and insert an alarm by hand:
+   ```sql
+   INSERT INTO historian.alarms (equipment_id, alarm_type, severity, message, raised_at)
+   VALUES ('CHI-SORT-01', 'OVERTEMP', 'CRITICAL', 'manual demo alarm', SYSUTCDATETIME());
+   GO
+   ```
+   It's on the dashboard before you can alt-tab. `make verify` runs this proof end-to-end and prints the measured CDC latency.
+
+## How it works
+
+### SQL Server (the historian)
+
+`db/sqlserver/` creates database `ups` with three schemas — `historian` (tags, tag_values, alarms), `ops` (facilities, equipment, routes, trailers, packages, scan_events), `fleet` (vehicles, drivers, fault_codes, vehicle_faults, maintenance_orders) — enables CDC on all 14 tables, and creates the `materialize` login with the documented grants. The CDC capture job's polling interval is tuned from 5s to 1s.
+
+Notable modeling choice: `packages.planned_sort_equipment_id` (the **sort plan**) links every package to the sorter it *will* go through. That's what lets a jam put packages at risk *before* they reach the machine — the cross-silo edge that makes this a graph instead of three dashboards.
+
+### Materialize (the context graph)
+
+`db/materialize/init.sh` builds a three-tier topology:
+
+- **ingest** cluster: one `CREATE SOURCE … FROM SQL SERVER CONNECTION … FOR ALL TABLES`
+- **compute** cluster: silver views use idiomatic latest-value patterns (`DISTINCT ON` under `mz_now()` temporal filters, so arrangements stay bounded on append-only historian data); gold materialized views pre-join the silos:
+  - **`package_context_mv`** — the hero view: one row per active package with its facility, last scan, planned sorter + that sorter's alarm state, trailer, tractor + that tractor's faults, and a computed `risk_level`
+  - `hub_health_mv`, `equipment_status_mv` (telemetry pivoted wide), `fleet_risk_mv` (faults ⋈ trailer ⋈ loaded-package count), `hub_throughput_minute_mv`
+  - `late_package_risk_v` — packages within 4h of their delivery promise (`mz_now()` filter; lateness can't be a stored column)
+- **serving** cluster: indexes on everything the API/copilot reads — point lookups answer in milliseconds regardless of write load
+
+### The copilot
+
+`agents/` is a LangGraph ReAct agent (FastAPI + SSE at :8081). Its system prompt forces `get_context_graph()` first — the ontology (`ontology/ontology.yaml`) tells it how entities connect, so its reasoning follows real relationships. Seven read tools query Materialize directly (asyncpg, `SET CLUSTER = serving`); two write-back tools (`acknowledge_alarm`, `create_maintenance_order`) write to SQL Server via pymssql — **observe from the graph, act on the system of record**.
+
+### The simulator
+
+`simulator/` plays the physical world: historian samples every 2s, a package lifecycle state machine (CREATED → … → DELIVERED, with scans tied to specific equipment), trailer dispatch/arrival cycles, fleet fault noise, and a scenario engine (`POST :8085/scenario/{name}`) that bends the telemetry, raises alarms, and freezes affected packages. Acknowledging a jam alarm releases the equipment — closing the copilot's action loop.
+
+## Repo layout
+
+```
+ontology/ontology.yaml     the explicit ontology (classes, relationships, view bindings)
+db/sqlserver/              DDL + CDC enablement + materialize user (one-shot init)
+db/materialize/init.sh     clusters, source, silver/gold views, serving indexes
+simulator/                 data generator + scenario engine (:8085)
+api/                       FastAPI read layer over the graph (:8080)
+agents/                    LangGraph copilot, 9 tools, SSE chat (:8081)
+web/                       React dashboard + chat widget (:5173)
+scripts/verify.sh          end-to-end proof (CDC latency, graph, write-back)
 ```
 
-See [aws/README.md](aws/README.md) for full details.
+## Operational notes
 
-### Generate live load
-
-```bash
-make load-gen           # 5 orders/min (demo profile)
-make load-gen-standard  # 20 orders/min
-make load-gen-peak      # 60 orders/min
-make load-gen-stress    # 200 orders/min
-```
-
-## Project Structure
-
-```
-live-context-graph-demo/
-├── docker-compose.yml
-├── Makefile
-├── .env.example
-│
-├── db/
-│   ├── migrations/             # SQL migrations
-│   ├── seed/                   # Demo data
-│   ├── materialize/            # Materialize view initialization
-│   └── scripts/                # Load test data generator
-│
-├── api/                        # FastAPI backend
-│   └── src/
-│       ├── routes/
-│       │   ├── search.py       # Vector search + impact endpoints
-│       │   └── query_stats.py  # Write triple, metrics, lineage
-│       ├── ontology/
-│       └── triples/
-│
-├── embeddings-shim/            # Local OpenAI-compatible /v1/embeddings (bge-small)
-│   └── app.py
-├── connect/                    # Kafka Connect image + connector configs
-│   ├── Dockerfile              # OpenSearch sink + perfect-embeddings SMT
-│   ├── connectors/             # orders (with embed SMT) + inventory sink JSON
-│   └── register-connectors.sh
-├── os-bootstrap/               # OpenSearch index templates (knn_vector, synonyms)
-│   └── templates/              #   orders.json, inventory.json + create-indices.sh
-│   ├── orders-index.json
-│   ├── inventory-index.json
-│   └── create-indices.sh
-├── propagation-tap/            # CDC tap → propagation events API (:8083)
-│   └── src/
-│       ├── tap.py              # Avro consumer, before/after field diffs
-│       ├── propagation_events.py
-│       └── propagation_api.py
-│
-├── web/                        # React demo UI
-│   └── src/
-│       ├── components/
-│       │   ├── LineageGraph.tsx        # Architecture diagram (3 scenarios)
-│       │   ├── VectorPipelineCard.tsx  # Hybrid search UI
-│       │   ├── WriteTripleForm.tsx     # Triple write form
-│       │   ├── SearchIndexUpdates.tsx  # Impact marker bar
-│       │   └── PropagationWidget.tsx   # Real-time event stream
-│       └── pages/
-│           └── QueryStatisticsPage.tsx # Main demo page
-│
-├── agents/                     # LangGraph agent (optional)
-│   └── src/
-│       ├── server.py           # FastAPI + SSE streaming
-│       └── tools/
-│
-└── docs/
-```
-
-## Known Limitations
-
-### Approximate embed time in the search card
-
-The "Hybrid Vector Search" card flashes a result when it is re-embedded (detected by the embedding vector changing) and shows the client-observed time of that change. There is no server-side per-embed timestamp, so on first sighting it shows when the result entered the view rather than a historical embed time.
-
-### Avro ↔ OpenSearch type handling (sink views)
-
-Materialize's Avro Debezium output doesn't map 1:1 onto OpenSearch's hand-built mappings, so the sinks read from `orders_sink_v` / `inventory_sink_v` (materialized views over the app-facing MVs) that normalize types:
-
-- **Decimals** — `numeric`/`DECIMAL` encode as Avro `decimal` (bytes), which the sink serializes as base64 and `float` fields reject. The views cast them to `double precision`.
-- **Timestamps** — some date columns are raw text, others are `timestamptz` (epoch-micros). The views `to_char(... AT TIME ZONE 'UTC', ...)` them into one ISO-8601 string the OpenSearch `date` parser accepts.
-- **`line_items`** — the `jsonb` column sinks as a JSON *string*, not a nested object, so it's mapped as non-indexed `text` and parsed back to a list in the API (`_parse_line_items`).
-
-Keeping these in `*_sink_v` views leaves the API/Zero-facing MVs untouched. The Connect image also pins the Aiven OpenSearch connector to 3.1.x (4.x needs Java 21; cp-kafka-connect 7.9.7 is Java 17), and the embeddings shim runs under hypercorn (the SMT's HTTP/2 client needs h2c, which uvicorn drops).
-
-### kNN index maintenance (deleted-doc bloat)
-
-The sink UPSERTs an order doc on every change — including price-only updates that don't re-embed — and each UPSERT tombstones the prior Lucene version. In a `knn_vector` index, deleted vectors stay in the per-segment HNSW graph until merged, and kNN traversal (`ef_search`-bounded) wastes its budget on tombstones, so recall collapses once the deleted ratio gets high. The index templates set `index.merge.policy.deletes_pct_allowed: 10` so background merges keep the deleted ratio low (and the graph mostly-live) automatically. Under heavy bursts you can still expunge on demand: `POST /orders/_forcemerge?only_expunge_deletes=true`.
-
-### Delivery Bundling (opt-in, CPU intensive)
-
-`WITH MUTUALLY RECURSIVE` views that group compatible orders by store, time window, inventory, and courier capacity. Disabled by default (~460s of compute).
-
-```bash
-make up-agent-bundling
-```
-
-## Agent Skills
-
-This repo includes the [materialize-docs](https://github.com/MaterializeInc/agent-skills) skill for Claude Code, which provides Materialize documentation in-context when working on this project.
-
-```bash
-# Update to latest version
-npx skills update
-```
-
-## License
-
-MIT
+- **CDC latency**: expect 1–3s end-to-end. The floor is SQL Server's CDC capture job (tuned to 1s polling); Materialize adds ~100ms.
+- **Idle databases snapshot slowly**: SQL Server CDC only notifies idle consumers every 5 minutes, so the compose file starts the simulator *before* `materialize-init` — live writes keep the snapshot fast.
+- **Timestamps** are `datetime2(3)` everywhere; SQL Server's default `datetime2(7)` exceeds Materialize's microsecond precision and would be rounded.
+- **Retention**: the simulator prunes `tag_values` (>60 min) and `scan_events` (>24h). Safe because every view over them is temporal-filtered to a shorter window — deletes never change a result.
+- **Corporate proxies**: all Dockerfiles trust any `*.crt` placed in their build context, if your network intercepts TLS.
+- `make clean` resets everything (drops volumes) for a fresh start.

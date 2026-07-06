@@ -1,22 +1,18 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Corporate-proxy friendly: if the build context provides extra CA
+# certificates (*.crt), trust them for package downloads.
+COPY requirements.txt *.crt ./
+RUN if [ -n "$(find . -maxdepth 1 -name '*.crt' -print -quit)" ]; then \
+        cp ./*.crt /usr/local/share/ca-certificates/ && update-ca-certificates; \
+    fi
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
-# Install Python dependencies
-COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
+COPY src/ ./src/
 
 EXPOSE 8081
 

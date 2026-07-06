@@ -1,28 +1,21 @@
-FROM python:3.11-slim
+# Build context is the repo root (see docker-compose.yml) so the shared
+# ontology/ontology.yaml can be baked into the image.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Corporate-proxy friendly: if the build context provides extra CA
+# certificates (*.crt at the repo root), trust them for package downloads.
+COPY api/requirements.txt *.crt ./
+RUN if [ -n "$(find . -maxdepth 1 -name '*.crt' -print -quit)" ]; then \
+        cp ./*.crt /usr/local/share/ca-certificates/ && update-ca-certificates; \
+    fi
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
-# Install Python dependencies
-COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-# Pre-download the fastembed model into the image so the first vector search
-# doesn't stall waiting on a HuggingFace download at runtime.
-# FASTEMBED_CACHE_PATH is set here and inherited by the running container.
-ENV FASTEMBED_CACHE_PATH=/app/.fastembed_cache
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+COPY api/src/ ./src/
+COPY ontology/ontology.yaml ./ontology.yaml
 
 EXPOSE 8080
 

@@ -3,7 +3,12 @@ import { MessageCircle, Trash2, X, Send, ChevronDown, ChevronRight, Maximize2, M
 import ReactMarkdown from 'react-markdown';
 import { useChat, ChatMessage, ThinkingEvent } from '../contexts/ChatContext';
 
-// Format timestamp for display
+const SUGGESTED_PROMPTS = [
+  'What is happening at Worldport right now?',
+  'Which packages should we act on first?',
+  'Any vehicles that need maintenance?',
+];
+
 function formatTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString('en-US', {
     hour12: false,
@@ -12,14 +17,13 @@ function formatTime(timestamp: number): string {
   });
 }
 
-// Truncate long content and add ellipsis indicator
 function truncateContent(content: string | undefined, maxLength: number = 200): { text: string; truncated: boolean } {
   if (!content) return { text: '', truncated: false };
   if (content.length <= maxLength) return { text: content, truncated: false };
   return { text: content.slice(0, maxLength), truncated: true };
 }
 
-// Thinking indicator component - shows tool calls and thinking in real-time
+// Thinking indicator - shows tool calls in real-time
 function ThinkingDisplay({ events, isLive }: { events: ThinkingEvent[]; isLive: boolean }) {
   const [isExpanded, setIsExpanded] = useState(true);
 
@@ -40,8 +44,8 @@ function ThinkingDisplay({ events, isLive }: { events: ThinkingEvent[]; isLive: 
             <div key={idx} className="flex items-start gap-2 text-gray-400">
               {event.type === 'tool_call' && (
                 <div className="flex flex-wrap items-center gap-1">
-                  <span className="text-blue-400">Calling</span>
-                  <span className="font-mono text-cyan-400">{event.data.name}</span>
+                  <span className="text-amber-400">Calling</span>
+                  <span className="font-mono text-yellow-300">{event.data.name}</span>
                   {event.data.args && Object.keys(event.data.args).length > 0 && (
                     (() => {
                       const argsStr = Object.entries(event.data.args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
@@ -72,7 +76,6 @@ function ThinkingDisplay({ events, isLive }: { events: ThinkingEvent[]; isLive: 
   );
 }
 
-// Message bubble component
 function MessageBubble({ message, isStreaming }: { message: ChatMessage; isStreaming: boolean }) {
   const isUser = message.role === 'user';
   const showThinking = message.thinking && message.thinking.length > 0;
@@ -81,12 +84,9 @@ function MessageBubble({ message, isStreaming }: { message: ChatMessage; isStrea
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div
         className={`max-w-[85%] rounded-lg px-3 py-2 ${
-          isUser
-            ? 'bg-green-600 text-white'
-            : 'bg-gray-800 text-gray-100'
+          isUser ? 'bg-amber-600 text-white' : 'bg-gray-800 text-gray-100'
         }`}
       >
-        {/* Thinking events (for assistant messages) */}
         {!isUser && showThinking && (
           <div className="mb-2 pb-2 border-b border-gray-700">
             <ThinkingDisplay
@@ -96,10 +96,9 @@ function MessageBubble({ message, isStreaming }: { message: ChatMessage; isStrea
           </div>
         )}
 
-        {/* Message content */}
         {message.status === 'streaming' && !message.content ? (
           <div className="flex items-center gap-2 text-gray-400">
-            <div className="h-2 w-2 bg-green-500 rounded-full animate-pulse" />
+            <div className="h-2 w-2 bg-amber-500 rounded-full animate-pulse" />
             <span>Thinking...</span>
           </div>
         ) : message.status === 'error' ? (
@@ -110,8 +109,7 @@ function MessageBubble({ message, isStreaming }: { message: ChatMessage; isStrea
           </div>
         )}
 
-        {/* Timestamp */}
-        <div className={`text-xs mt-1 ${isUser ? 'text-green-200' : 'text-gray-500'}`}>
+        <div className={`text-xs mt-1 ${isUser ? 'text-amber-200' : 'text-gray-500'}`}>
           {formatTime(message.timestamp)}
         </div>
       </div>
@@ -119,48 +117,39 @@ function MessageBubble({ message, isStreaming }: { message: ChatMessage; isStrea
   );
 }
 
-// Chat input component with auto-growing textarea
 function ChatInput() {
   const { sendMessage, isStreaming } = useChat();
   const [input, setInput] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const submit = () => {
     if (input.trim() && !isStreaming) {
       sendMessage(input);
       setInput('');
-      // Reset textarea height after sending
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
       }
     }
   };
 
-  // Handle Enter to submit, Shift+Enter for new line
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submit();
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (input.trim() && !isStreaming) {
-        sendMessage(input);
-        setInput('');
-        if (textareaRef.current) {
-          textareaRef.current.style.height = 'auto';
-        }
-      }
+      submit();
     }
   };
 
-  // Auto-resize textarea as content grows
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value);
-    // Reset height to auto to get the correct scrollHeight
     e.target.style.height = 'auto';
-    // Set height to scrollHeight, capped at 150px
     e.target.style.height = `${Math.min(e.target.scrollHeight, 150)}px`;
   };
 
-  // Focus input when widget opens
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
@@ -172,16 +161,16 @@ function ChatInput() {
         value={input}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
-        placeholder="Ask the operations assistant..."
+        placeholder="Ask the hub copilot..."
         disabled={isStreaming}
         rows={1}
-        className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 disabled:opacity-50 resize-none overflow-y-auto"
+        className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:opacity-50 resize-none overflow-y-auto"
         style={{ minHeight: '40px', maxHeight: '150px' }}
       />
       <button
         type="submit"
         disabled={!input.trim() || isStreaming}
-        className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium flex items-center gap-1 shrink-0"
+        className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium flex items-center gap-1 shrink-0"
       >
         <Send className="h-4 w-4" />
       </button>
@@ -189,43 +178,39 @@ function ChatInput() {
   );
 }
 
-// Chat panel content - shared between normal and expanded views
 function ChatPanelContent({
   isExpanded,
-  onToggleExpand
+  onToggleExpand,
 }: {
   isExpanded: boolean;
   onToggleExpand: () => void;
 }) {
-  const { messages, setIsOpen, isStreaming, clearMessages, currentThinking, threadId } = useChat();
+  const { messages, setIsOpen, isStreaming, clearMessages, currentThinking, threadId, sendMessage } = useChat();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, currentThinking]);
 
   return (
-    <div className="flex flex-col h-full bg-gray-900 border-l border-gray-700">
+    <div className="flex flex-col h-full bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700 shrink-0">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700 shrink-0 bg-ups-brown">
         <div className="flex items-center gap-2">
-          <MessageCircle className="h-5 w-5 text-green-500" />
-          <span className="font-medium text-white">Operations Assistant</span>
-          {isStreaming && (
-            <span className="h-2 w-2 bg-green-500 rounded-full animate-pulse" />
-          )}
+          <MessageCircle className="h-5 w-5 text-ups-gold" />
+          <span className="font-medium text-white">Hub Operations Copilot</span>
+          {isStreaming && <span className="h-2 w-2 bg-ups-gold rounded-full animate-pulse" />}
         </div>
         <div className="flex items-center gap-1">
           <button
             onClick={onToggleExpand}
             className="p-1.5 hover:bg-gray-800 rounded transition-colors"
-            title={isExpanded ? "Collapse to panel" : "Expand to full screen"}
+            title={isExpanded ? 'Collapse to panel' : 'Expand to full screen'}
           >
             {isExpanded ? (
-              <Minimize2 className="h-4 w-4 text-gray-400 hover:text-green-400" />
+              <Minimize2 className="h-4 w-4 text-gray-400 hover:text-amber-400" />
             ) : (
-              <Maximize2 className="h-4 w-4 text-gray-400 hover:text-green-400" />
+              <Maximize2 className="h-4 w-4 text-gray-400 hover:text-amber-400" />
             )}
           </button>
           <button
@@ -245,7 +230,6 @@ function ChatPanelContent({
         </div>
       </div>
 
-      {/* Thread ID indicator */}
       {threadId && (
         <div className="px-3 py-1 bg-gray-800/50 text-xs text-gray-500 border-b border-gray-700 shrink-0">
           Session: <span className="font-mono">{threadId}</span>
@@ -255,21 +239,26 @@ function ChatPanelContent({
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500 text-sm">
-            <MessageCircle className="h-12 w-12 mb-2 opacity-50" />
-            <p>Ask me about orders, inventory,</p>
-            <p>stores, or couriers.</p>
+          <div className="flex flex-col items-center justify-center h-full text-gray-500 text-sm gap-3">
+            <MessageCircle className="h-12 w-12 opacity-50" />
+            <p>Ask about packages, sortation equipment, alarms, or the fleet.</p>
+            <div className="flex flex-col gap-2 w-full px-2">
+              {SUGGESTED_PROMPTS.map((prompt) => (
+                <button
+                  key={prompt}
+                  onClick={() => sendMessage(prompt)}
+                  className="text-left text-xs px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-300 transition-colors"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
           <>
             {messages.map((message) => (
-              <MessageBubble
-                key={message.id}
-                message={message}
-                isStreaming={isStreaming}
-              />
+              <MessageBubble key={message.id} message={message} isStreaming={isStreaming} />
             ))}
-            {/* Live thinking indicator during streaming */}
             {isStreaming && currentThinking.length > 0 && (
               <div className="bg-gray-800 rounded-lg px-3 py-2">
                 <ThinkingDisplay events={currentThinking} isLive={true} />
@@ -280,17 +269,14 @@ function ChatPanelContent({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input area */}
       <ChatInput />
     </div>
   );
 }
 
-// Main widget component
 export default function ChatWidget() {
   const { messages, isOpen, setIsOpen, isExpanded, setIsExpanded } = useChat();
 
-  // Handle escape key to close expanded view
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && isExpanded) {
@@ -301,13 +287,12 @@ export default function ChatWidget() {
     return () => window.removeEventListener('keydown', handleEscape);
   }, [isExpanded, setIsExpanded]);
 
-  // Floating bubble when closed - positioned above the PropagationWidget (h-10 = 40px)
   if (!isOpen) {
     return (
       <button
         onClick={() => setIsOpen(true)}
-        className="fixed bottom-16 right-6 h-14 w-14 bg-green-600 hover:bg-green-700 text-white rounded-full shadow-lg flex items-center justify-center transition-all z-50 hover:scale-105"
-        title="Open Operations Assistant"
+        className="fixed bottom-6 right-6 h-14 w-14 bg-amber-600 hover:bg-amber-700 text-white rounded-full shadow-lg flex items-center justify-center transition-all z-50 hover:scale-105"
+        title="Open Hub Operations Copilot"
       >
         <MessageCircle className="h-6 w-6" />
         {messages.length > 0 && (
@@ -319,33 +304,23 @@ export default function ChatWidget() {
     );
   }
 
-  // Expanded modal mode
   if (isExpanded) {
     return (
       <>
-        {/* Backdrop */}
-        <div
-          className="fixed inset-0 bg-black/60 z-50"
-          onClick={() => setIsExpanded(false)}
-        />
-        {/* Modal */}
+        <div className="fixed inset-0 bg-black/60 z-50" onClick={() => setIsExpanded(false)} />
         <div className="fixed inset-4 md:inset-8 lg:inset-12 z-50 flex items-center justify-center">
-          <div className="w-full h-full max-w-6xl bg-gray-900 rounded-lg shadow-2xl overflow-hidden">
-            <ChatPanelContent
-              isExpanded={true}
-              onToggleExpand={() => setIsExpanded(false)}
-            />
+          <div className="w-full h-full max-w-6xl">
+            <ChatPanelContent isExpanded={true} onToggleExpand={() => setIsExpanded(false)} />
           </div>
         </div>
       </>
     );
   }
 
-  // Panel mode when open - NOT fixed positioning, fills parent container
+  // Floating panel anchored bottom-right
   return (
-    <ChatPanelContent
-      isExpanded={false}
-      onToggleExpand={() => setIsExpanded(true)}
-    />
+    <div className="fixed bottom-6 right-6 w-[420px] h-[600px] max-h-[80vh] z-50 shadow-2xl">
+      <ChatPanelContent isExpanded={false} onToggleExpand={() => setIsExpanded(true)} />
+    </div>
   );
 }

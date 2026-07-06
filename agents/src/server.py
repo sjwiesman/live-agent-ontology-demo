@@ -1,4 +1,4 @@
-"""FastAPI server for the FreshMart Operations Agent with SSE streaming."""
+"""FastAPI server for the UPS Hub Operations Copilot with SSE streaming."""
 
 import json
 import logging
@@ -16,7 +16,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from src.config import get_settings
-from src.graphs.ops_assistant_graph import cleanup_graph_resources, run_assistant
+from src.graphs.hub_copilot_graph import cleanup_graph_resources, run_assistant
 
 logger = logging.getLogger(__name__)
 
@@ -24,35 +24,29 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup/shutdown."""
-    # Log API key status on startup
     settings = get_settings()
-    if settings.openai_api_key:
-        logger.info("OpenAI API key: FOUND")
     if settings.anthropic_api_key:
         logger.info("Anthropic API key: FOUND")
-
-    if not settings.openai_api_key and not settings.anthropic_api_key:
-        logger.error("No LLM API key configured! Set OPENAI_API_KEY or ANTHROPIC_API_KEY")
+    if settings.openai_api_key:
+        logger.info("OpenAI API key: FOUND")
+    if not settings.anthropic_api_key and not settings.openai_api_key:
+        logger.error("No LLM API key configured! Set ANTHROPIC_API_KEY or OPENAI_API_KEY")
 
     yield
-    # Cleanup on shutdown
     await cleanup_graph_resources()
 
 
-# Rate limiter setup
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
-    title="FreshMart Operations Agent",
-    description="AI-powered operations assistant with SSE streaming",
+    title="UPS Hub Operations Copilot",
+    description="AI copilot over the live context graph, with SSE streaming",
     lifespan=lifespan,
 )
 
-# Register rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS for frontend - restrict origins based on environment
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -79,41 +73,27 @@ class ChatResponse(BaseModel):
 
 
 async def event_generator(message: str, thread_id: str):
-    """
-    Generate SSE events from the assistant.
+    """Generate SSE events from the copilot.
 
     Event types:
     - tool_call: {"name": str, "args": dict}
     - tool_result: {"content": str}
-    - thinking: {"content": str}  (extended thinking if enabled)
     - response: str (final complete response)
     - error: {"message": str}
     - done: {}  (stream complete)
     """
     try:
         async for event_type, data in run_assistant(message, thread_id=thread_id, stream_events=True):
-            # Format as SSE
-            event_data = {"type": event_type, "data": data}
-            yield f"data: {json.dumps(event_data)}\n\n"
-
-        # Signal completion
+            yield f"data: {json.dumps({'type': event_type, 'data': data})}\n\n"
         yield f"data: {json.dumps({'type': 'done', 'data': {}})}\n\n"
-    except Exception as e:
-        error_event = {"type": "error", "data": {"message": str(e)}}
-        yield f"data: {json.dumps(error_event)}\n\n"
+    except Exception as e:  # noqa: BLE001 - stream the error to the client
+        yield f"data: {json.dumps({'type': 'error', 'data': {'message': str(e)}})}\n\n"
 
 
 @app.post("/chat/stream")
 @limiter.limit("10/minute")
 async def chat_stream(chat_request: ChatRequest, request: Request):
-    """
-    SSE streaming endpoint for chat.
-
-    Returns a stream of Server-Sent Events with thinking states and responses.
-    The thread_id is returned in the X-Thread-Id response header.
-
-    Rate limit: 10 requests per minute per IP address.
-    """
+    """SSE streaming chat. The thread_id is returned in the X-Thread-Id header."""
     if not chat_request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
 
@@ -133,13 +113,7 @@ async def chat_stream(chat_request: ChatRequest, request: Request):
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("10/minute")
 async def chat(chat_request: ChatRequest, request: Request):
-    """
-    Non-streaming chat endpoint (backwards compatible).
-
-    Returns the final response after all processing is complete.
-
-    Rate limit: 10 requests per minute per IP address.
-    """
+    """Non-streaming chat: returns the final response when complete."""
     if not chat_request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
 
